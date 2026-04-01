@@ -132,6 +132,18 @@ git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
 
 **openclaw integration:** `sessions_spawn` with `runtime: "acp"` and `thread: true` + `mode: "session"` maps naturally to this — the session persists and subsequent dispatches route to the same session. The tmux layer lives inside the ACP harness.
 
+### 2.9 Per-Worktree Agent Log
+
+Each git worktree gets a single append-only log file:
+```
+~/.openclaw/worktrees/<TID>/.agent-log.jsonl
+```
+Each action appended as one JSON line: `{ ts, agent, action, result, error? }`.
+
+- 冷燕 and 傅红雪 write to this log during ACP execution.
+- Q仔 reads `.agent-log.jsonl` when processing escalations — replaces need for human to dig through tmux history.
+- No Vector, no Prometheus, no metrics endpoint at this stage. Revisit when simple logs prove insufficient for Q仔 triage.
+
 ---
 
 ## 3. Standard Pipeline
@@ -224,8 +236,32 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 2. 再开启 SOUL.md 约束，记录通过率 B。
 3. 若 A ≈ B（差距 < 2%）：该约束为**候选删除**，标记供人工确认。
 4. 若 B > A：该约束**仍有价值**，保留。
-5. 将 review 结果写入 `~/.openclaw/shared/harness-review-<date>.md`，通知用户。
+5. 连续 2 次 harness review 中未触发的规则 → 候选删除，需明确签字方可移除。
+6. 将 review 结果写入 `~/.openclaw/shared/harness-review-<date>.md`，通知用户。
 目的：防止 SOUL.md 积累针对旧模型弱点的"cargo cult"规则。
+
+## Harness 改进飞轮（L3 触发）
+每次 L3 升级解决后，Q仔 必须执行：
+1. 诊断根因：什么约束缺失导致此次 L3？
+2. 在责任 Agent 的 SOUL.md 中补充对应规则（1-3 行）。
+3. 规则使用 YAML frontmatter 格式（见下）确保可追踪。
+目的：每次故障都让系统变强一次。
+
+## SOUL.md 文件结构原则
+- 核心 SOUL.md 控制在约 60 行以内（目录，非百科全书）。
+- 详细规则移入 `RULES/` 子目录（如 `RULES/qa-gate.md`、`RULES/acp-constraint.md`）。
+- Q仔 在 dispatch 时根据任务类型注入相关 RULES/ 文件到子 agent 上下文，不依赖 agent 自行判断加载。
+- 每条规则使用 YAML frontmatter 追踪生命周期：
+```yaml
+---
+rules:
+  - id: R-001
+    text: "凡写代码/改代码：必须在 tmux builder-acp 中通过 ACP 执行"
+    added: 2026-04-02
+    reason: "设计决策：确保所有实现落地在持久 ACP session，防止上下文丢失"
+    status: active
+---
+```
 ```
 
 **AGENTS.md — 角色表（8人）:**
@@ -269,6 +305,12 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 
 ## Pipeline 规则
 - 架构决策分级：L1（单服务内）/L2（跨服务接口）自主决定；L3（多仓库/基础设施）需 L3 升级。
+
+## Application Legibility（代码对 Agent 可读）
+- 强制分层架构：Types → Config → Repo → Service → Runtime → UI，只允许向下依赖。
+- 层边界违规由 linter 机械执行，CI 直接挂，无需 LLM 判断。
+- Linter 错误信息必须嵌入修复指引（不只报"违规"，还说"怎么改"）。
+- 架构决策以 ADR 格式写入仓库（`docs/adr/`），不用外部 wiki。层级规则本身也有对应 ADR。
 
 ## 基础设施配置评审（强制）
 - 傅红雪产出的所有 K8s YAML / Terraform / CI 脚本，必须经 李寻欢 审查后方可执行。
@@ -533,12 +575,17 @@ Every code PR must pass linter before QA gate can run:
 - `escalation_trigger: { exit_code: "!= 0" }` — linter failure promotes to agentic (冷燕 fixes then re-runs)
 - Linter pass is a required PR check in GitHub Actions; merge blocked if linter fails
 
-### 6.8 GC Cron Job
+### 6.8 GC Cron Job + Entropy Checks
 
 Plugin registers a daily cron at 03:00:
 - Delete `~/.openclaw/shared/handoffs/<TID>.md` where `completed_at + 24h < now`
 - Delete `~/.openclaw/shared/events/<TID>.jsonl` by same rule
-- Log deletion count to gateway log
+- **Entropy checks** (folded into same cron, no separate agent):
+  - Scan for stale TODOs in last week's merged PRs — log count to gateway
+  - Run architecture violation check (same linter rules as CI) across full codebase — log violations found
+  - Scan for SOUL.md files exceeding 80 lines (proxy for "directory becoming encyclopedia") — flag for Q仔
+- Log all counts to gateway log; Q仔 receives summary on next session start via HEARTBEAT.md
+- Build a dedicated entropy subagent only when daily checks consistently surface issues that the linter + CI pipeline cannot auto-fix
 
 ---
 
