@@ -51,6 +51,26 @@ All inter-agent `sessions_send` calls are intercepted by a **PostToolUse hook** 
   - Lock timeout: 5s; exponential backoff retry (max 3 attempts before error)
   - Lock file contains PID + timestamp; on next acquire, check if PID is alive — if dead, treat as stale lock and forcibly clear
   - Gateway startup: scan and clear all stale lock files before accepting requests
+  - **Single state file** — no separate `active-tasks.json`. All fields live in `tasks.json` keyed by TID:
+    ```typescript
+    interface TaskEntry {
+      status: TaskStatus;       // pending | in_progress | done | failed | escalated
+      agentId: string;
+      createdAt: string;
+      completedAt?: string;
+      tid?: string;
+      orchestratorViolations?: number;
+      tmuxSession?: string;     // e.g., "builder-acp"
+      worktree?: string;        // e.g., "~/.openclaw/worktrees/<TID>"
+      branch?: string;          // e.g., "feat/<TID>"
+      prUrl?: string;           // GitHub PR URL
+      checks?: {
+        prCreated?: boolean;
+        ciPassed?: boolean;
+        reviewPassed?: boolean;
+      };
+    }
+    ```
 - **Human views:** `STATUS.md` and `TASKS.md` are read-only derived views, regenerated after each state change
 - **Handoff artifacts:** `~/.openclaw/shared/handoffs/<TID>.md` — each pipeline stage appends a section to the same TID file. Retained until task completion + 24h.
 - **Event log:** `~/.openclaw/shared/events/<TID>.jsonl` — P2P inter-agent messages appended here (not injected into Q仔 context). Q仔 queries on demand when processing a callback.
@@ -70,7 +90,22 @@ Any procedure that modifies model settings MUST update both levels, or explicitl
 
 > **Critical:** The auto-restore watchdog must be an **external process** (systemd unit, cron, or healthcheck script) — NOT a plugin hook. A plugin cannot restore the system that runs it.
 
-### 2.6 TID Format
+### 2.6 Operational Monitoring Heartbeat
+
+A **deterministic shell script** (`~/.openclaw/bin/check-agents.sh`) runs every 10 minutes via system cron (not plugin). Zero LLM token cost.
+
+**Responsibilities:**
+- Check tmux sessions alive (`tmux has-session -t builder-acp`, `devops-acp`)
+- Check open PRs on tracking branches (`gh pr list --head feat/<TID>`)
+- Check CI status for open PRs (`gh run list --branch feat/<TID>`)
+- Auto-restart failed agent (max 3 retries — policy already in Section 4.2; script is the trigger)
+- Alert Q仔 only when human intervention needed (via `sessions_send` CLI if gateway alive; fallback to macOS `osascript` / ntfy if gateway down)
+
+**Output:** Writes `~/.openclaw/shared/monitor-status.json` (machine-readable). Q仔 reads on session start via HEARTBEAT.md mechanism — no new plugin hook.
+
+> **Distinct from GC cron (Section 6.10):** GC runs daily at 03:00 for artifact cleanup. This runs every 10 minutes for liveness. Different concerns, different cadences. Same principle as config watchdog: external process, not plugin.
+
+### 2.7 TID Format
 
 ```
 YYYYMMDD-HHMMss-<tag>-<4randchars>
@@ -79,7 +114,7 @@ Example: `20260402-143012-feat-auth-x7k2`
 
 Second-precision + 4-char random suffix eliminates same-minute collision for parallel spawns. TID is the idempotency key for all dispatch, callback, and handoff operations. Max 3 orchestration rounds per TID (generation counter tracked in state store) to prevent infinite loops.
 
-### 2.7 Git Worktree per Feature
+### 2.8 Git Worktree per Feature
 
 Every new feature or infra change gets its own **git worktree**. This isolates work-in-progress across parallel tasks and prevents branch context pollution in the main checkout.
 
@@ -110,7 +145,7 @@ git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
 - Worktree is created at task start, removed only after PR is merged (not before).
 - If a task is abandoned (L3 escalation, cancelled), worktree is archived to `~/.openclaw/worktrees/archived/<TID>` for post-mortem, not deleted.
 
-### 2.8 GitHub as Single Source of Truth
+### 2.9 GitHub as Single Source of Truth
 
 **GitHub is the canonical truth for all durable artifacts.** No artifact is considered "done" until it exists in a GitHub repository.
 
@@ -129,7 +164,7 @@ git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
 - No "it works locally" handoffs. If it's not in GitHub, it doesn't exist.
 - Q仔 treats the PR URL as the authoritative reference for any task's output.
 
-### 2.9 tmux Persistent ACP Sessions
+### 2.10 tmux Persistent ACP Sessions
 
 `sessions_spawn` with `runtime: "acp"` spawns a one-shot process. For agents that need multi-step edit-run-verify loops (冷燕, 傅红雪), a **persistent tmux session** is required to maintain file system state, git context, and ACP process across turns.
 
@@ -146,7 +181,7 @@ git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
 
 **openclaw integration:** `sessions_spawn` with `runtime: "acp"` and `thread: true` + `mode: "session"` maps naturally to this — the session persists and subsequent dispatches route to the same session. The tmux layer lives inside the ACP harness.
 
-### 2.10 Per-Worktree Agent Log
+### 2.11 Per-Worktree Agent Log
 
 Each git worktree gets a single append-only log file:
 ```
@@ -254,6 +289,15 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 6. 将 review 结果写入 `~/.openclaw/shared/harness-review-<date>.md`，通知用户。
 目的：防止 SOUL.md 积累针对旧模型弱点的"cargo cult"规则。
 
+## 主动扫描例程（Proactive Scanning）
+以下例程由**外部 cron 脚本**触发（不是 Q仔 轮询）。脚本是确定性的（零 LLM token），通过 `sessions_send` 向 Q仔 发送结构化事件。Q仔 收到事件后按以下规则 dispatch：
+
+- **`SENTRY_ERRORS` 事件**（每日 09:00，`scan-sentry.sh`）：dispatch builder 修复每个新错误（一个 TID per error）。
+- **`MEETING_ACTIONS` 事件**（会后，`scan-meetings.sh` 检测新会议记录）：dispatch pm（花满楼）整理功能需求，再 dispatch builder 实现。
+- **`CHANGELOG_TRIGGER` 事件**（每日 18:00，`gen-changelog.sh`）：dispatch builder 更新 changelog 和客户文档。
+
+三个脚本位于 `~/.openclaw/bin/`，由系统 cron 管理（不在 plugin 内）。
+
 ## Harness 改进飞轮（L3 触发）
 每次 L3 升级解决后，Q仔 必须执行：
 1. 诊断根因：什么约束缺失导致此次 L3？
@@ -314,8 +358,32 @@ rules:
 - QA subagent 必须覆盖以下类别，每类明确报告"发现问题"或"已测，未发现"：
   边界条件 / 错误处理 / 输入校验 / 并发安全 / 安全漏洞
 - **禁止"整体感觉不错"式通过**；必须有逐类验证记录，方可出具 pass。
-- QA gate 通过 → 通知 Q仔 继续流程。
-- QA gate 失败 → 阻断合并，sessions_send Q仔，Q仔 重新 dispatch 冷燕。
+- QA gate 通过 → sessions_send Q仔 "QA_PASS: <TID>"
+- QA gate 失败 → sessions_send Q仔 "QA_FAIL: <TID> <原因>"
+
+### 多模型交叉 Review 策略
+
+5 类别是 **what**（覆盖要求）；多模型策略是 **how**（执行方式）。两者互补，不冲突。
+
+李寻欢 spawn 三个并行 review subagent（角色定义，不硬编码模型名——模型在 `agents/cto/models.json` 配置）：
+
+| 角色 | 聚焦 | 默认模型映射 |
+|------|------|------------|
+| Reviewer A（深度） | 边界 bug、逻辑错误、竞态条件；误报率低 | Codex / gpt-5.3-codex |
+| Reviewer B（广度） | 安全漏洞、可扩展性；发现 A 遗漏的模式 | Gemini（优先用免费 tier）|
+| Reviewer C（验证） | 接收 A + B 的 findings 作为输入，过滤误报，确认真 Critical | Claude |
+
+**成本控制（强制）：**
+- Reviewer B（成本最低）先运行。若 B 未发现任何问题 **且** PR diff ≤ 200 行 → 跳过 A 和 C，单模型审查即可。
+- 每个 reviewer subagent 设置 `max_cost_usd`（在 `team_dispatch` 参数中）。
+- Reviewer C 不看原始 diff，只看 A + B 的 findings — 降低 token 消耗。
+
+**Findings 合并规则：**
+- Union of all findings，按 `file:line:category` 去重。
+- 2+ reviewer 同时标记同一问题 → 自动升级为 CRITICAL。
+- Reviewer C 过滤误报后，李寻欢出具最终单一 pass/fail 判决（不是投票）。
+
+**Dispatch 模式：** Reviewer A + B 用 `pattern: "parallel"` 并行 spawn，Reviewer C 串行（需要 A+B findings 作为输入）。
 
 ## Pipeline 规则
 - 架构决策分级：L1（单服务内）/L2（跨服务接口）自主决定；L3（多仓库/基础设施）需 L3 升级。
@@ -353,6 +421,7 @@ rules:
 - ACP 执行完成后，必须 commit + push + 开 PR，将 PR URL + commit SHA 写入 handoff artifact。
 - PR merge 后由 Q仔/傅红雪 触发 worktree 清理。
 - **没有 PR = 没有完成。**
+- **UI 变更必须附截图**：如果 PR 修改了任何 UI 组件（`src/components/**`、`src/pages/**`、`*.tsx`、`*.vue` 等），PR description 必须包含截图（markdown image 或截图 URL）。否则 CI 失败（见 Section 6.11）。
 ```
 
 **Plugin enforcement:** PreToolUse hook in `openclaw-team-plugin` intercepts `exec`/`write`/`edit` tool calls from builder in non-ACP sessions and rejects them.
@@ -536,6 +605,17 @@ export default function plugin(api: OpenClawPluginAPI): void {
 - `escalation_trigger?`: condition that promotes a `"deterministic"` node to `"agentic"` (e.g., `{ exit_code: "!= 0" }`, `{ output_lines: "> 50" }`)
 - `max_cost_usd?`: budget cap for this dispatch; auto-escalate to L2 when exceeded (prevents runaway agentic loops)
 - `model?`: explicit model override for this dispatch (e.g., `"claude-opus-4-6"`). **Rule-based, not dynamic:** Q仔 MUST specify model override only for explicitly enumerated triggers defined in SOUL.md (e.g., `"use opus for architecture review"`). No fuzzy task-complexity classification — that introduces overhead and non-determinism.
+- `retryContext?`: structured context for agent re-dispatch on failure. Makes retries smarter rather than repeating the same prompt:
+  ```typescript
+  retryContext?: {
+    failureType: 'context_overflow' | 'wrong_direction' | 'needs_clarification' | 'ci_failure';
+    scopeNarrow?: string[];       // file paths to focus on (for context_overflow)
+    originalRequirement?: string; // from handoff artifact (for wrong_direction)
+    additionalContext?: string;   // PRD excerpt, customer email, etc. (for needs_clarification)
+    previousAttemptTid: string;   // links retry to the failed attempt
+  }
+  ```
+  When present, the `team_dispatch` handler prepends failure-specific context to the handoff artifact. Retry count limits (max 3) are unchanged — `retryContext` improves quality within those limits, not the threshold.
 
 **Behavior:**
 1. Generate TID if not provided
@@ -641,6 +721,15 @@ Plugin registers a daily cron at 03:00:
   - Scan for SOUL.md files exceeding 80 lines (proxy for "directory becoming encyclopedia") — flag for Q仔
 - Log all counts to gateway log; Q仔 receives summary on next session start via HEARTBEAT.md
 - Build a dedicated entropy subagent only when daily checks consistently surface issues that the linter + CI pipeline cannot auto-fix
+
+### 6.11 PR Description Validation Gate
+
+For PRs that touch UI files, CI must verify the PR description contains a screenshot. This is a **deterministic check** (zero LLM cost), enforced by a GitHub Actions step:
+
+- **Trigger condition:** PR diff touches files matching `src/components/**`, `src/pages/**`, `**/*.tsx`, `**/*.vue`, or `**/*.css` (configurable glob list in repo config)
+- **Validation:** PR body must contain at least one markdown image (`![`) or a screenshot URL pattern (`https://*.png`, `https://*.jpg`, `https://*.webp`, screenshot.cloud, etc.)
+- **Failure:** CI check fails with: `"UI changes detected but no screenshots found in PR description. Add screenshots to show what changed."`
+- **Principle:** Same as linter hard gate — mechanical enforcement, no LLM judgment.
 
 ---
 
