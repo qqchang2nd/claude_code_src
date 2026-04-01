@@ -65,6 +65,42 @@ Example: `20260402-143012-feat-auth-x7k2`
 
 Second-precision + 4-char random suffix eliminates same-minute collision for parallel spawns. TID is the idempotency key for all dispatch, callback, and handoff operations. Max 3 orchestration rounds per TID (generation counter tracked in state store) to prevent infinite loops.
 
+### 2.6 GitHub as Single Source of Truth
+
+**GitHub is the canonical truth for all durable artifacts.** No artifact is considered "done" until it exists in a GitHub repository.
+
+| Artifact | Owner | GitHub location |
+|----------|-------|----------------|
+| Business code | 冷燕 | Feature branch → PR → merge |
+| Tests | 冷燕 | Same PR as code |
+| Infra configs (K8s/TF/CI) | 傅红雪 | Infra repo, dedicated branch → PR |
+| PRD documents | 花满楼 | Docs repo (e.g. `docs/prd/<TID>.md`) |
+| Architecture decisions | 李寻欢 | ADR in docs repo |
+
+**Rules:**
+- 冷燕 must commit + push + open PR before notifying Q仔 of completion. The handoff artifact must include the PR URL and head commit SHA.
+- 傅红雪 must commit + push infra configs before requesting 李寻欢 infra review. Review happens on the PR diff, not on local files.
+- 花满楼 must commit PRD to the docs repo before dispatching to 李寻欢 for architecture review.
+- No "it works locally" handoffs. If it's not in GitHub, it doesn't exist.
+- Q仔 treats the PR URL as the authoritative reference for any task's output.
+
+### 2.7 tmux Persistent ACP Sessions
+
+`sessions_spawn` with `runtime: "acp"` spawns a one-shot process. For agents that need multi-step edit-run-verify loops (冷燕, 傅红雪), a **persistent tmux session** is required to maintain file system state, git context, and ACP process across turns.
+
+**Convention:**
+- 冷燕: tmux session named `builder-acp`, window `claude-code` or `gemini`
+- 傅红雪: tmux session named `devops-acp`, window `claude-code` or `gemini`
+
+**Protocol:**
+1. On task receive: check if named tmux session exists (`tmux has-session -t builder-acp`). Create if missing.
+2. Send task context to the running ACP process via tmux (`tmux send-keys`).
+3. ACP process executes edits, runs tests, commits, pushes.
+4. When done: agent reads ACP output from tmux pane, extracts PR URL + commit SHA, writes to handoff artifact, then `sessions_send` callback to Q仔.
+5. tmux session stays alive between tasks (do not kill after each task).
+
+**openclaw integration:** `sessions_spawn` with `runtime: "acp"` and `thread: true` + `mode: "session"` maps naturally to this — the session persists and subsequent dispatches route to the same session. The tmux layer lives inside the ACP harness.
+
 ---
 
 ## 3. Standard Pipeline
@@ -210,13 +246,15 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 - 测试类型：单元测试 + 集成测试（针对 API/数据库操作）。
 
 ## 编码执行约束（强制）
-- 凡写代码/改代码：必须通过 ACP 会话执行，使用 Claude Code 或 Gemini CLI。
+- 凡写代码/改代码：必须在 **tmux session `builder-acp`** 中通过 Claude Code 或 Gemini CLI 执行。
+- tmux session 常驻，不在任务间销毁。收到任务时检查 session 是否存在，不存在则创建。
 - 禁止在非 ACP 的普通对话/子代理模式里直接产出大段实现代码；
-  必须通过 ACP（runtime: acp）落地，并在 closeout 给出验证命令与变更路径。
-- ACP 会话结束后，必须将变更路径 + 测试验证命令写入 handoff artifact。
+  必须通过 ACP 落地，并在 closeout 给出 PR URL + commit SHA。
+- ACP 执行完成后，必须 commit + push + 开 PR，然后将 PR URL + commit SHA 写入 handoff artifact。
+- **没有 PR = 没有完成。** 不接受"本地已改好"的 handoff。
 ```
 
-**Plugin enforcement:** PreToolUse hook in `openclaw-team-plugin` detects code-block output from builder in non-ACP sessions and rejects it.
+**Plugin enforcement:** PreToolUse hook in `openclaw-team-plugin` intercepts `exec`/`write`/`edit` tool calls from builder in non-ACP sessions and rejects them.
 
 ---
 
@@ -241,8 +279,9 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 - 验收标准清单
 
 ## Dispatch 触发
-- Q仔 发送功能请求 → 花满楼 写 PRD → sessions_send Q仔 → Q仔 dispatch 李寻欢 架构评审
+- Q仔 发送功能请求 → 花满楼 写 PRD → commit + push 到 docs repo（`docs/prd/<TID>.md`）→ sessions_send Q仔 附 GitHub URL → Q仔 dispatch 李寻欢 架构评审
 - 如需竞品/可行性分析：向 Q仔 请求 dispatch 陆小凤，等待结果后再写 PRD
+- **没有提交到 GitHub 的 PRD 不算完成。**
 
 ## PRD 审查循环
 - 李寻欢 可退回 PRD 要求澄清，最多 2 轮
@@ -306,13 +345,16 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 - 响应部署失败和告警
 
 ## 编码执行约束（强制）
-- 凡修改基础设施配置/脚本：必须通过 ACP 会话执行，使用 Claude Code 或 Gemini CLI。
+- 凡修改基础设施配置/脚本：必须在 **tmux session `devops-acp`** 中通过 Claude Code 或 Gemini CLI 执行。
+- tmux session 常驻，不在任务间销毁。
 - 例外：只读操作（查看 dashboard、读取日志）无需 ACP。
-- ACP 会话结束后，必须将变更路径 + 回滚命令写入 handoff artifact。
+- 配置产出后必须 commit + push 到 infra repo，开 PR，然后 sessions_send Q仔 "INFRA_READY: <TID> <PR_URL>"。
+- 李寻欢 对 PR diff 做 infra review（不是本地文件）。
+- 收到 INFRA_REVIEW_OK 后，在 tmux session 中执行部署，并将 rollback 命令写入 handoff artifact。
 
 ## Dispatch 触发
-- 李寻欢 QA gate 通过 → Q仔 dispatch 傅红雪 **先产出**基础设施配置（不执行）
-- 配置产出后 → sessions_send Q仔 "INFRA_READY: <TID>"，等待 李寻欢 infra review
+- 李寻欢 QA gate 通过 → Q仔 dispatch 傅红雪 **先产出**基础设施配置并推送 PR（不执行）
+- PR 推送后 → sessions_send Q仔 "INFRA_READY: <TID> <PR_URL>"，等待 李寻欢 infra review
 - 收到 INFRA_REVIEW_OK 后 → 执行部署
 - 收到部署任务时，必须确认 QA gate TID 存在且状态为 pass
 
