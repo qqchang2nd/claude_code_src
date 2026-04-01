@@ -43,22 +43,27 @@ Two new capabilities:
 
 ### 2.3 P2P Visibility
 
-All inter-agent `sessions_send` calls are intercepted by a **PostToolUse hook** in the plugin and CC'd to Q仔. No agent-to-agent communication is invisible to the orchestrator.
+All inter-agent `sessions_send` calls are intercepted by a **PostToolUse hook** in the plugin and written to the TID event log (`~/.openclaw/shared/events/<TID>.jsonl`). They are **not** injected inline into Q仔's context (avoids context bloat from multi-round technical discussions). Q仔 reads the event log only when processing a callback (task complete/fail), pulling only the summary it needs.
 
 ### 2.4 State Store
 
 - **TASKS state:** JSON file with file locking (not markdown) — concurrent-safe
+  - Lock timeout: 5s; exponential backoff retry (max 3 attempts before error)
+  - Lock file contains PID + timestamp; on next acquire, check if PID is alive — if dead, treat as stale lock and forcibly clear
+  - Gateway startup: scan and clear all stale lock files before accepting requests
 - **Human views:** `STATUS.md` and `TASKS.md` are read-only derived views, regenerated after each state change
-- **Handoff artifacts:** `~/.openclaw/shared/handoffs/<TID>.md` — each pipeline stage appends a section to the same TID file. Retained until task completion + 24h (not a fixed wall-clock 24h).
+- **Handoff artifacts:** `~/.openclaw/shared/handoffs/<TID>.md` — each pipeline stage appends a section to the same TID file. Retained until task completion + 24h.
+- **Event log:** `~/.openclaw/shared/events/<TID>.jsonl` — P2P inter-agent messages appended here (not injected into Q仔 context). Q仔 queries on demand when processing a callback.
+- **GC:** Plugin registers a daily cron (03:00) to delete expired handoff artifacts and event logs. Q仔 HEARTBEAT.md triggers GC check.
 
 ### 2.5 TID Format
 
 ```
-YYYYMMDD-HHMM-<tag>
+YYYYMMDD-HHMMss-<tag>-<4randchars>
 ```
-Example: `20260402-1430-feat-auth`
+Example: `20260402-143012-feat-auth-x7k2`
 
-TID is the idempotency key for all dispatch, callback, and handoff operations. Max 3 orchestration rounds per TID (generation counter tracked in state store) to prevent infinite loops.
+Second-precision + 4-char random suffix eliminates same-minute collision for parallel spawns. TID is the idempotency key for all dispatch, callback, and handoff operations. Max 3 orchestration rounds per TID (generation counter tracked in state store) to prevent infinite loops.
 
 ---
 
@@ -77,9 +82,13 @@ Q仔 (goal decompose)
     ↓
 冷燕 (implementation via ACP + tests ≥80%)
     ↓
-李寻欢 (adversarial QA gate, independent subagent)
+李寻欢 (adversarial QA gate, independent subagent) [max 3 rounds]
     ↓ [if QA pass]
-傅红雪 (deployment via ACP)
+傅红雪 (produce infra configs: K8s YAML / Terraform / CI scripts)
+    ↓
+李寻欢 (infra config review gate)
+    ↓ [if infra review pass]
+傅红雪 (execute deployment via ACP)
     ↓
 Q仔 (dispatch to 花满楼 for acceptance)
     ↓
@@ -92,7 +101,7 @@ Q仔 (mark delivery complete, notify user)
 
 **PRD review loop limit:** max 2 rounds between 花满楼 and 李寻欢. If unresolved after 2 rounds → L3 escalation (block for human decision).
 
-**QA gate failure:** 李寻欢 blocks merge, notifies Q仔 → Q仔 re-dispatches to 冷燕.
+**QA gate failure:** 李寻欢 blocks merge, notifies Q仔 → Q仔 re-dispatches to 冷燕. **Max 3 QA rounds** per TID (tracked in state store); if 3rd round still fails → L3 escalation (block for human decision).
 
 ---
 
@@ -181,6 +190,12 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 
 ## Pipeline 规则
 - 架构决策分级：L1（单服务内）/L2（跨服务接口）自主决定；L3（多仓库/基础设施）需 L3 升级。
+
+## 基础设施配置评审（强制）
+- 傅红雪产出的所有 K8s YAML / Terraform / CI 脚本，必须经 李寻欢 审查后方可执行。
+- 审查点：权限配置、资源限额、密钥引用、幂等性、回滚可行性。
+- 通过 → sessions_send Q仔 "INFRA_REVIEW_OK: <TID>"
+- 拒绝 → sessions_send Q仔 "INFRA_REVIEW_FAIL: <TID> <原因>"，Q仔 重新 dispatch 傅红雪修改。
 ```
 
 ---
@@ -296,7 +311,9 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 - ACP 会话结束后，必须将变更路径 + 回滚命令写入 handoff artifact。
 
 ## Dispatch 触发
-- 李寻欢 QA gate 通过 → Q仔 dispatch 傅红雪 执行部署
+- 李寻欢 QA gate 通过 → Q仔 dispatch 傅红雪 **先产出**基础设施配置（不执行）
+- 配置产出后 → sessions_send Q仔 "INFRA_READY: <TID>"，等待 李寻欢 infra review
+- 收到 INFRA_REVIEW_OK 后 → 执行部署
 - 收到部署任务时，必须确认 QA gate TID 存在且状态为 pass
 
 ## 部署完成回调
@@ -347,9 +364,10 @@ SOUL.md 内容已正确，不变。
 // Plugin entry point
 export default function plugin(api: OpenClawPluginAPI): void {
   api.registerTool('team_dispatch', teamDispatchTool);
-  api.registerHook('agent:bootstrap', injectSoulHook);
-  api.registerHook('tools:post', p2pVisibilityHook);    // CC Q仔 on all sessions_send
-  api.registerHook('tools:pre', enforceAcpHook);        // Block code output from builder in non-ACP
+  api.registerHook('agent:bootstrap', injectSoulHook);         // Inject SOUL.md + IDENTITY.md into subagents
+  api.registerHook('tools:post', p2pEventLogHook);             // Append P2P messages to event log (not Q仔 context)
+  api.registerHook('tools:pre', enforceAcpHook);               // Block exec/write/edit tools for builder/devops in non-ACP
+  api.registerCron('0 3 * * *', gcHandoffsAndEvents);          // Daily GC: delete expired handoffs + event logs
 }
 ```
 
@@ -380,13 +398,22 @@ Prepends both files to subagent system prompt. Hard-fails spawn if files not fou
 ### 6.4 P2P Visibility Hook (PostToolUse on sessions_send)
 
 When any agent calls `sessions_send` to a target other than Q仔:
-- Duplicate message also sent to Q仔 main session
-- Prefix: `[P2P CC from <sourceAgent> → <targetAgent>]`
+- Append event to `~/.openclaw/shared/events/<TID>.jsonl` (NOT injected into Q仔 context)
+- Event format: `{ ts, from, to, summary }` where summary is first 200 chars of message
+- Q仔 reads event log only when processing a callback (on-demand, not inline)
 
-### 6.5 ACP Enforcement Hook (PreToolUse)
+### 6.5 ACP Enforcement Hook (PreToolUse on write/exec tools)
 
-When `builder` or `devops` agent produces output containing a markdown code block (` ``` `) in a non-ACP session:
-- Intercept and reject with: `"[BLOCKED] Code output requires ACP session. Use sessions_spawn with runtime: acp."`
+When `builder` or `devops` agent calls `exec`, `write`, or `edit` tools in a non-ACP session:
+- Intercept and reject with: `"[BLOCKED] File write/exec requires ACP session. Use sessions_spawn with runtime: acp."`
+- **Explanatory code blocks in message text are not blocked** — only actual tool invocations that write or execute.
+
+### 6.6 GC Cron Job
+
+Plugin registers a daily cron at 03:00:
+- Delete `~/.openclaw/shared/handoffs/<TID>.md` where `completed_at + 24h < now`
+- Delete `~/.openclaw/shared/events/<TID>.jsonl` by same rule
+- Log deletion count to gateway log
 
 ---
 
