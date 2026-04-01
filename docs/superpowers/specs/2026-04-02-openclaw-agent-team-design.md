@@ -217,6 +217,15 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 
 ## 李寻欢降级模式
 - 3次重试无响应 → L2 升级 → 冷燕自评降级通过 → 记录 degraded-mode
+
+## Harness Review（模型升级时触发）
+模型升级后，执行轻量 harness review：
+1. 用新模型跑现有 QA 测试集，先关闭 SOUL.md 约束，记录通过率 A。
+2. 再开启 SOUL.md 约束，记录通过率 B。
+3. 若 A ≈ B（差距 < 2%）：该约束为**候选删除**，标记供人工确认。
+4. 若 B > A：该约束**仍有价值**，保留。
+5. 将 review 结果写入 `~/.openclaw/shared/harness-review-<date>.md`，通知用户。
+目的：防止 SOUL.md 积累针对旧模型弱点的"cargo cult"规则。
 ```
 
 **AGENTS.md — 角色表（8人）:**
@@ -251,7 +260,10 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 
 ## QA Gate（强制）
 - 冷燕提交后，李寻欢独立 spawn 对抗性 QA subagent（不依赖冷燕自评）。
-- QA subagent 目标：找出冷燕测试未覆盖的边界条件和回归风险。
+- QA subagent 严苛程度：以"这个 bug 会在凌晨三点叫醒人"的标准审查。
+- QA subagent 必须覆盖以下类别，每类明确报告"发现问题"或"已测，未发现"：
+  边界条件 / 错误处理 / 输入校验 / 并发安全 / 安全漏洞
+- **禁止"整体感觉不错"式通过**；必须有逐类验证记录，方可出具 pass。
 - QA gate 通过 → 通知 Q仔 继续流程。
 - QA gate 失败 → 阻断合并，sessions_send Q仔，Q仔 重新 dispatch 冷燕。
 
@@ -397,6 +409,11 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 - 部署成功 → sessions_send Q仔 "DEPLOY_OK: <TID> <env> <version>"
 - 部署失败 → sessions_send Q仔 "DEPLOY_FAIL: <TID> <原因>" → Q仔 决定回滚或升级
 
+## CI 重试限制（强制）
+- CI 失败 → 傅红雪自动修复一次（`max_ci_retries: 2`，可按 repo 覆盖）。
+- 第 2 次仍失败 → 直接 L3 升级，不再重试。
+- 例外：若修复 diff 超过原始 diff 的 50% 行数，无论剩余重试次数，自动 L3 升级（大改可能引入新问题）。
+
 ## 边界
 - 生产环境部署 = L3 操作，必须有 Q仔 明确指令
 - 不做产品决策，不写业务代码
@@ -456,13 +473,19 @@ export default function plugin(api: OpenClawPluginAPI): void {
 - `pattern`: `"baton"` | `"parallel"` (default: `"baton"`)
 - `tid?`: existing TID to continue (omit to generate new)
 - `priority?`: `"l1"` | `"l2"` | `"l3"` (default: `"l1"`)
+- `nodeType`: `"agentic"` | `"deterministic"` (default: `"agentic"`)
+  - `"deterministic"`: scripted execution, zero LLM calls (e.g., run linter, git push, CI status check)
+  - `"agentic"`: full LLM session (e.g., write code, write PRD, architecture review)
+- `escalation_trigger?`: condition that promotes a `"deterministic"` node to `"agentic"` (e.g., `{ exit_code: "!= 0" }`, `{ output_lines: "> 50" }`)
+- `max_cost_usd?`: budget cap for this dispatch; auto-escalate to L2 when exceeded (prevents runaway agentic loops)
 
 **Behavior:**
 1. Generate TID if not provided
 2. Create/append handoff artifact at `~/.openclaw/shared/handoffs/<TID>.md`
 3. Update JSON state store (file-locked write)
-4. Execute `sessions_send` (baton) or `sessions_spawn` (parallel)
-5. Register callback expectation in state store
+4. If `nodeType: "deterministic"`: run scripted command, check escalation_trigger, promote to agentic if triggered
+5. Execute `sessions_send` (baton) or `sessions_spawn` (parallel) for agentic nodes
+6. Register callback expectation in state store; enforce `max_cost_usd` budget
 
 ### 6.3 agent:bootstrap Hook
 
@@ -485,7 +508,32 @@ When `builder` or `devops` agent calls `exec`, `write`, or `edit` tools in a non
 - Intercept and reject with: `"[BLOCKED] File write/exec requires ACP session. Use sessions_spawn with runtime: acp."`
 - **Explanatory code blocks in message text are not blocked** — only actual tool invocations that write or execute.
 
-### 6.6 GC Cron Job
+### 6.6 Per-Agent Tool Whitelist
+
+Principle of least privilege — each agent receives only the tools it needs. More tools ≠ better performance (Stripe finding).
+
+| Agent | Allowed Tools | Scope Notes |
+|-------|--------------|-------------|
+| main (Q仔) | all tools | Orchestrator — full access |
+| research (陆小凤) | `read`, `write`, `web_search`, `memory_search` | `write` scoped to research output dir only |
+| cto (李寻欢) | `read`, `memory_search`, `sessions_spawn` | `sessions_spawn` for QA subagent; subagent inherits exec from ACP |
+| builder (冷燕) | `read`, `sessions_spawn` (runtime:acp only) | `read` for existing code; ACP enforcement handles write/exec gate |
+| pm (花满楼) | `read`, `write`, `memory_search` | `write` path-scoped to `docs/**` and `*.md` only |
+| biz (高老大) | `read`, `write`, `web_search` | `write` path-scoped to `docs/**` only |
+| devops (傅红雪) | `read`, `sessions_spawn` (runtime:acp), `bash` (deterministic nodes only) | `bash` allowed for deterministic CI/status checks without full ACP overhead |
+| cio (阿飞) | `read`, `web_search`, `memory_search` | Read-only analysis; no write |
+
+Plugin enforces whitelists via PreToolUse hook. Unlisted tool calls return: `"[BLOCKED] Tool not in agent <id> allowlist."`
+
+### 6.7 Linter as Hard Gate
+
+Every code PR must pass linter before QA gate can run:
+- Linter config lives at **repo root** (not per-worktree copy — worktree creation verifies config exists, does not duplicate it)
+- Linter runs as a `nodeType: "deterministic"` dispatch node in the pipeline
+- `escalation_trigger: { exit_code: "!= 0" }` — linter failure promotes to agentic (冷燕 fixes then re-runs)
+- Linter pass is a required PR check in GitHub Actions; merge blocked if linter fails
+
+### 6.8 GC Cron Job
 
 Plugin registers a daily cron at 03:00:
 - Delete `~/.openclaw/shared/handoffs/<TID>.md` where `completed_at + 24h < now`
