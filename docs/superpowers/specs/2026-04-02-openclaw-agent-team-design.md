@@ -56,7 +56,21 @@ All inter-agent `sessions_send` calls are intercepted by a **PostToolUse hook** 
 - **Event log:** `~/.openclaw/shared/events/<TID>.jsonl` — P2P inter-agent messages appended here (not injected into Q仔 context). Q仔 queries on demand when processing a callback.
 - **GC:** Plugin registers a daily cron (03:00) to delete expired handoff artifacts and event logs. Q仔 HEARTBEAT.md triggers GC check.
 
-### 2.5 TID Format
+### 2.5 Config Override Hierarchy
+
+> **Rule:** `agents/{name}/models.json` > `openclaw.json`. Per-agent config always wins.
+
+Any procedure that modifies model settings MUST update both levels, or explicitly delete the per-agent override file. Failure to do so causes "config change with no effect" — the practitioner's #2 big pit.
+
+**Config Change Safety Flow** (enforced by plugin PreToolUse hook on all writes to `openclaw.json` or `agents/*/models.json`):
+1. Validate JSON syntax before write — reject on parse error
+2. Require explicit authorization token (not silent write)
+3. Backup current file to `<file>.bak.<timestamp>` before applying
+4. Gateway health check after config change — if Gateway fails to come up within 30s, trigger restore
+
+> **Critical:** The auto-restore watchdog must be an **external process** (systemd unit, cron, or healthcheck script) — NOT a plugin hook. A plugin cannot restore the system that runs it.
+
+### 2.6 TID Format
 
 ```
 YYYYMMDD-HHMMss-<tag>-<4randchars>
@@ -65,7 +79,7 @@ Example: `20260402-143012-feat-auth-x7k2`
 
 Second-precision + 4-char random suffix eliminates same-minute collision for parallel spawns. TID is the idempotency key for all dispatch, callback, and handoff operations. Max 3 orchestration rounds per TID (generation counter tracked in state store) to prevent infinite loops.
 
-### 2.6 Git Worktree per Feature
+### 2.7 Git Worktree per Feature
 
 Every new feature or infra change gets its own **git worktree**. This isolates work-in-progress across parallel tasks and prevents branch context pollution in the main checkout.
 
@@ -96,7 +110,7 @@ git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
 - Worktree is created at task start, removed only after PR is merged (not before).
 - If a task is abandoned (L3 escalation, cancelled), worktree is archived to `~/.openclaw/worktrees/archived/<TID>` for post-mortem, not deleted.
 
-### 2.7 GitHub as Single Source of Truth
+### 2.8 GitHub as Single Source of Truth
 
 **GitHub is the canonical truth for all durable artifacts.** No artifact is considered "done" until it exists in a GitHub repository.
 
@@ -115,7 +129,7 @@ git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
 - No "it works locally" handoffs. If it's not in GitHub, it doesn't exist.
 - Q仔 treats the PR URL as the authoritative reference for any task's output.
 
-### 2.8 tmux Persistent ACP Sessions
+### 2.9 tmux Persistent ACP Sessions
 
 `sessions_spawn` with `runtime: "acp"` spawns a one-shot process. For agents that need multi-step edit-run-verify loops (冷燕, 傅红雪), a **persistent tmux session** is required to maintain file system state, git context, and ACP process across turns.
 
@@ -132,7 +146,7 @@ git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
 
 **openclaw integration:** `sessions_spawn` with `runtime: "acp"` and `thread: true` + `mode: "session"` maps naturally to this — the session persists and subsequent dispatches route to the same session. The tmux layer lives inside the ACP harness.
 
-### 2.9 Per-Worktree Agent Log
+### 2.10 Per-Worktree Agent Log
 
 Each git worktree gets a single append-only log file:
 ```
@@ -503,6 +517,7 @@ export default function plugin(api: OpenClawPluginAPI): void {
   api.registerHook('agent:bootstrap', injectSoulHook);         // Inject SOUL.md + IDENTITY.md into subagents
   api.registerHook('tools:post', p2pEventLogHook);             // Append P2P messages to event log (not Q仔 context)
   api.registerHook('tools:pre', enforceAcpHook);               // Block exec/write/edit tools for builder/devops in non-ACP
+  api.registerHook('tools:post', orchestratorSoftWarnHook);    // Warn when Q仔 calls impl tools directly (counter → L2 at N=3)
   api.registerCron('0 3 * * *', gcHandoffsAndEvents);          // Daily GC: delete expired handoffs + event logs
 }
 ```
@@ -520,6 +535,7 @@ export default function plugin(api: OpenClawPluginAPI): void {
   - `"agentic"`: full LLM session (e.g., write code, write PRD, architecture review)
 - `escalation_trigger?`: condition that promotes a `"deterministic"` node to `"agentic"` (e.g., `{ exit_code: "!= 0" }`, `{ output_lines: "> 50" }`)
 - `max_cost_usd?`: budget cap for this dispatch; auto-escalate to L2 when exceeded (prevents runaway agentic loops)
+- `model?`: explicit model override for this dispatch (e.g., `"claude-opus-4-6"`). **Rule-based, not dynamic:** Q仔 MUST specify model override only for explicitly enumerated triggers defined in SOUL.md (e.g., `"use opus for architecture review"`). No fuzzy task-complexity classification — that introduces overhead and non-determinism.
 
 **Behavior:**
 1. Generate TID if not provided
@@ -550,7 +566,34 @@ When `builder` or `devops` agent calls `exec`, `write`, or `edit` tools in a non
 - Intercept and reject with: `"[BLOCKED] File write/exec requires ACP session. Use sessions_spawn with runtime: acp."`
 - **Explanatory code blocks in message text are not blocked** — only actual tool invocations that write or execute.
 
-### 6.6 Per-Agent Tool Whitelist
+### 6.5.1 Callback ACK Protocol
+
+Q仔 sends an explicit ACK back to the caller **only for state-changing callbacks** — those where the caller must block before proceeding:
+
+| Callback | ACK required? | Reason |
+|----------|--------------|--------|
+| `DEPLOY_OK` | Yes | 傅红雪 must confirm deployment is fully registered before closing task |
+| `INFRA_REVIEW_OK` | Yes | 傅红雪 must confirm infra review acceptance before executing deployment |
+| `ROLLBACK_OK` | Yes | Confirms rollback applied before 傅红雪 closes incident |
+| `ACCEPT` (花满楼) | No | GitHub PR merge is the authoritative record |
+| `REJECT` (花满楼) | No | Q仔 re-dispatch is triggered by the callback itself |
+| `QA_PASS` / `QA_FAIL` | No | Q仔 re-dispatch handles failure; pass continues pipeline |
+| `INFRA_READY` | No | Automatically queues infra review; no blocker for caller |
+
+> **Why not ACK everything:** E2E ACK on every callback adds a synchronous round-trip with no value. The only callbacks that need ACK are those where the sender must confirm receipt before taking an irreversible next step (deploy, infra apply, rollback).
+
+### 6.6 Orchestrator Soft-Warning Hook (PostToolUse on impl tools)
+
+Q仔 is orchestrator, not implementor. If Q仔 calls `write`, `edit`, or `exec` tools directly (instead of dispatching to 冷燕/傅红雪), the plugin records it as a harness violation:
+
+- **Hook fires:** PostToolUse on `write`, `edit`, `exec` calls originating from `main` agent
+- **Response:** Emit soft warning to Q仔 context: `"[HARNESS WARN] Q仔 called <tool> directly. Route implementation work through team_dispatch → builder/devops. Violation count: N"`
+- **Counter:** Violation count tracked in state store (key `orchestrator_violations`), reset per TID
+- **Escalation:** At N=3 violations in a single TID → L2 escalation: notify human that Q仔 is bypassing team structure
+
+> **Why soft warning, not hard block:** Hard block causes Q仔 to loop or fabricate justifications. Soft warning + counter gives the harness improvement flywheel a chance to surface the root cause (missing SOUL.md rule or unclear task boundaries) for a targeted fix.
+
+### 6.7 Per-Agent Tool Whitelist
 
 Principle of least privilege — each agent receives only the tools it needs. More tools ≠ better performance (Stripe finding).
 
@@ -567,7 +610,7 @@ Principle of least privilege — each agent receives only the tools it needs. Mo
 
 Plugin enforces whitelists via PreToolUse hook. Unlisted tool calls return: `"[BLOCKED] Tool not in agent <id> allowlist."`
 
-### 6.7 Linter as Hard Gate
+### 6.8 Linter as Hard Gate
 
 Every code PR must pass linter before QA gate can run:
 - Linter config lives at **repo root** (not per-worktree copy — worktree creation verifies config exists, does not duplicate it)
@@ -575,7 +618,19 @@ Every code PR must pass linter before QA gate can run:
 - `escalation_trigger: { exit_code: "!= 0" }` — linter failure promotes to agentic (冷燕 fixes then re-runs)
 - Linter pass is a required PR check in GitHub Actions; merge blocked if linter fails
 
-### 6.8 GC Cron Job + Entropy Checks
+### 6.9 Skill Security Review Gate
+
+All new skills added to any agent must pass a security review before being enabled in production:
+
+- **Gate owner:** `security-reviewer` agent (not 李寻欢 — security auditing is a distinct specialty, not CTO responsibility)
+- **Trigger:** Q仔 dispatches `security-reviewer` via `team_dispatch` whenever a skill install/update PR is opened
+- **Scope:** Review skill code for: secrets leakage, path traversal, exec injection, excessive permission requests, unvalidated external inputs
+- **Pass:** `security-reviewer` sessions_send Q仔 `"SKILL_SECURITY_OK: <skill-name> <PR_URL>"`
+- **Fail:** `security-reviewer` sessions_send Q仔 `"SKILL_SECURITY_FAIL: <skill-name> <findings>"` → Q仔 blocks skill install, notifies human
+
+> This keeps 李寻欢 focused on architecture/QA and security concerns properly routed to a dedicated security lens.
+
+### 6.10 GC Cron Job + Entropy Checks
 
 Plugin registers a daily cron at 03:00:
 - Delete `~/.openclaw/shared/handoffs/<TID>.md` where `completed_at + 24h < now`
@@ -620,8 +675,18 @@ find ~/.openclaw/agents/biz -type f -name "*.md" -o -name "*.json" | \
   xargs sed -i 's/"ops"/"biz"/g; s/agent:ops:/agent:biz:/g'
 
 # 5. Update openclaw.json (agent list entries, workspace paths)
-# 6. Create workspace-devops and seed files
-# 7. Start openclaw gateway
+
+# 6. Update per-agent model override files (TWO-LEVEL CONFIG RULE)
+#    After renaming ko→pm and ops→biz, any per-agent models.json files
+#    must also be updated — openclaw.json change alone is NOT sufficient.
+#    Per-agent config wins over openclaw.json.
+[ -f ~/.openclaw/agents/pm/models.json ] && \
+  sed -i 's/"ko"/"pm"/g' ~/.openclaw/agents/pm/models.json
+[ -f ~/.openclaw/agents/biz/models.json ] && \
+  sed -i 's/"ops"/"biz"/g' ~/.openclaw/agents/biz/models.json
+
+# 7. Create workspace-devops and seed files
+# 8. Start openclaw gateway
 openclaw start
 ```
 
