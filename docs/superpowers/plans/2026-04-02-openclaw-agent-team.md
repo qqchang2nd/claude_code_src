@@ -330,6 +330,7 @@ cat > ~/.openclaw/workspace-devops/SOUL.md << 'SOUL'
 
 ## Dispatch 触发
 - 李寻欢 QA gate 通过 → Q仔 dispatch 傅红雪 先产出基础设施配置并推送 PR（不执行）
+- **收到部署任务时，必须确认 QA gate TID 存在且状态为 pass**（从 tasks.json 读取；缺失则拒绝执行并 sessions_send Q仔 "DEPLOY_BLOCKED: <TID> QA gate not confirmed"）
 - PR 推送后 → sessions_send Q仔 "INFRA_READY: <TID> <PR_URL>"，等待 李寻欢 infra review
 - 收到 INFRA_REVIEW_OK 后 → 执行部署
 
@@ -467,9 +468,9 @@ Q仔 接收到确定性脚本的 sessions_send 触发时，自动执行对应例
 
 | 触发信号 | 来源脚本 | Q仔 动作 |
 |---------|---------|---------|
-| `SENTRY_ERRORS: <count> issues` | `scan-sentry.sh`（每日晨间） | 评估优先级 → dispatch 李寻欢分析 → 视严重度 dispatch 冷燕 |
-| `MEETING_ACTIONS: <summary>` | `scan-meetings.sh`（会后触发） | 解析行动项 → 分配到相关 agent |
-| `CHANGELOG_TRIGGER: <since>` | `gen-changelog.sh`（每日晚间） | dispatch 高老大 或 直接生成 changelog，push PR |
+| `SENTRY_ERRORS: <count> issues` | `scan-sentry.sh`（每日 09:00） | dispatch **builder**（冷燕）修复每个新错误（一个 TID per error） |
+| `MEETING_ACTIONS: <summary>` | `scan-meetings.sh`（会后触发） | dispatch **pm**（花满楼）整理功能需求 → 再 dispatch builder 实现 |
+| `CHANGELOG_TRIGGER: <since>` | `gen-changelog.sh`（每日 18:00） | dispatch **builder**（冷燕）更新 changelog 和客户文档 |
 
 扫描脚本（外部 cron，零 LLM 成本）位于 `~/.openclaw/bin/`，由系统 cron 调度，结果通过 sessions_send 发给 Q仔。
 APPEND
@@ -480,7 +481,7 @@ APPEND
 wc -l ~/.openclaw/workspace/SOUL.md
 tail -20 ~/.openclaw/workspace/SOUL.md
 ```
-Expected: file ends with SOUL.md 文件结构原则 section.
+Expected: file ends with 主动扫描例程 section (the last section appended above).
 
 - [ ] **Step 3: Append 李寻欢 QA gate + legibility section to workspace-cto/SOUL.md**
 ```bash
@@ -514,18 +515,25 @@ cat >> ~/.openclaw/workspace-cto/SOUL.md << 'APPEND'
 - L3（多仓库 / 基础设施）：需 L3 升级，阻塞等人工
 
 ## 多模型 QA Review（成本门控）
-QA gate 使用三个 reviewer，顺序固定，前置 B 门控后续两者：
+QA gate 使用三个 reviewer subagent。模型在 `agents/cto/models.json` 配置，不硬编码：
 
-| 角色 | 模型 | 侧重 | 触发条件 |
-|------|------|------|---------|
-| Reviewer B（宽度+成本门控）| Gemini Flash（免费额度）| 代码覆盖率、快速回归 | **始终先跑** |
-| Reviewer A（深度）| Claude Sonnet 4.6 | 架构合理性、安全漏洞 | B 通过后触发 |
-| Reviewer C（验证）| Codex（细节校对）| 类型一致性、边界条件 | A 通过后触发 |
+| 角色 | 聚焦 | 默认模型映射 | 执行顺序 |
+|------|------|------------|---------|
+| Reviewer B（广度+成本门控）| 安全漏洞、可扩展性；发现 A 遗漏的模式 | Gemini（优先免费 tier）| **1 — 始终先跑** |
+| Reviewer A（深度）| 边界 bug、逻辑错误、竞态条件；误报率低 | Codex / gpt-5.3-codex | **2 — 与 B 并行（pattern: "parallel"）** |
+| Reviewer C（验证）| 接收 A+B findings 作为输入，过滤误报，确认真 Critical | Claude | **3 — 串行（需要 A+B findings）** |
 
-合并规则：
+**执行方式：**
+- Reviewer A + B 用 `team_dispatch pattern: "parallel"` 同时 spawn。
+- B 若未发现任何问题 **且** PR diff ≤ 200 行 → 跳过 A 和 C，单模型审查即可。
+- Reviewer C 不看原始 diff，只看 A+B 的 findings（降低 token 消耗）。
+
+**成本控制：** 每个 reviewer subagent 在 `team_dispatch` 参数中设置 `max_cost_usd`。
+
+**Findings 合并规则：**
 - 任何 reviewer 报告 CRITICAL → 直接 QA_FAIL，不等其他 reviewer。
-- 2+ reviewers 报告同一 HIGH → 提升为 CRITICAL。
-- 仅 1 reviewer 报告 HIGH → 保持 HIGH，列入修改建议但不阻塞。
+- 2+ reviewers 同时标记同一问题 → 自动升级为 CRITICAL。
+- Reviewer C 过滤误报后，李寻欢出具最终单一 pass/fail 判决（不是投票）。
 APPEND
 ```
 
@@ -1127,8 +1135,10 @@ export interface TaskEntry {
   worktree?: string;      // e.g. '~/.openclaw/worktrees/<TID>'
   branch?: string;        // e.g. 'feat/<TID>'
   prUrl?: string;         // GitHub PR URL once opened
-  checks?: {              // CI check results keyed by check name
-    [checkName: string]: 'pending' | 'pass' | 'fail';
+  checks?: {              // Matches spec §2.4 — three canonical check fields
+    prCreated?: boolean;
+    ciPassed?: boolean;
+    reviewPassed?: boolean;
   };
 }
 
@@ -1367,11 +1377,11 @@ interface ToolConfig {
 }
 
 interface RetryContext {
-  failureType: 'timeout' | 'qa_fail' | 'infra_fail' | 'budget_exceeded' | 'unknown';
-  scopeNarrow?: string;          // How the retry scope is reduced vs original
-  originalRequirement?: string;  // Copy of the original task text
-  additionalContext?: string;    // Extra info gathered from the failure
-  previousAttemptTid?: string;   // TID of the failed attempt
+  failureType: 'context_overflow' | 'wrong_direction' | 'needs_clarification' | 'ci_failure';
+  scopeNarrow?: string[];        // File paths to focus on (for context_overflow)
+  originalRequirement?: string;  // From handoff artifact (for wrong_direction)
+  additionalContext?: string;    // PRD excerpt, customer email, etc. (for needs_clarification)
+  previousAttemptTid: string;   // Required — links retry to the failed attempt
 }
 
 interface DispatchParams {
@@ -1413,13 +1423,13 @@ export function buildTeamDispatchTool(config: ToolConfig) {
           type: 'object',
           description: 'Structured context for retry dispatches. Omit on first attempt.',
           properties: {
-            failureType: { type: 'string', enum: ['timeout', 'qa_fail', 'infra_fail', 'budget_exceeded', 'unknown'] },
-            scopeNarrow: { type: 'string' },
+            failureType: { type: 'string', enum: ['context_overflow', 'wrong_direction', 'needs_clarification', 'ci_failure'] },
+            scopeNarrow: { type: 'array', items: { type: 'string' }, description: 'File paths to focus on (for context_overflow)' },
             originalRequirement: { type: 'string' },
             additionalContext: { type: 'string' },
             previousAttemptTid: { type: 'string' },
           },
-          required: ['failureType'],
+          required: ['failureType', 'previousAttemptTid'],
         },
       },
     },
@@ -2057,6 +2067,51 @@ interface GcConfig {
   handoffsDir: string;
   eventsDir: string;
   stateDir: string;
+  // workspacesRoot is derived as stateDir/.. (= ~/.openclaw) — no separate field needed
+}
+
+// Entropy checks: deterministic scans folded into the same daily cron (§6.10)
+async function runEntropyChecks(
+  workspacesRoot: string,
+  logger: { info: (m: string) => void }
+): Promise<void> {
+  const { readdir, readFile, stat } = await import('fs/promises');
+
+  // 1. Scan for SOUL.md files exceeding 80 lines
+  let soulmdsOver80 = 0;
+  try {
+    const entries = await readdir(workspacesRoot);
+    for (const entry of entries) {
+      if (!entry.startsWith('workspace')) continue;
+      const soulPath = join(workspacesRoot, entry, 'SOUL.md');
+      try {
+        const content = await readFile(soulPath, 'utf8');
+        const lines = content.split('\n').length;
+        if (lines > 80) {
+          soulmdsOver80++;
+          logger.info(`[openclaw-team-plugin] GC entropy: ${entry}/SOUL.md has ${lines} lines (>80 — candidate for RULES/ split)`);
+        }
+      } catch { /* SOUL.md missing for this workspace, skip */ }
+    }
+  } catch { /* workspacesRoot missing, skip */ }
+
+  // 2. Count stale worktrees (directories >7 days old with no recent git activity)
+  let staleWorktrees = 0;
+  const worktreesDir = join(workspacesRoot, '..', 'worktrees');
+  try {
+    const trees = await readdir(worktreesDir);
+    const now = Date.now();
+    for (const tree of trees) {
+      const treePath = join(worktreesDir, tree);
+      const s = await stat(treePath).catch(() => null);
+      if (s && (now - s.mtimeMs) > 7 * 24 * 60 * 60 * 1000) {
+        staleWorktrees++;
+        logger.info(`[openclaw-team-plugin] GC entropy: stale worktree ${tree} (>7 days, no activity)`);
+      }
+    }
+  } catch { /* worktrees dir missing, skip */ }
+
+  logger.info(`[openclaw-team-plugin] GC entropy summary: soulmds_over_80=${soulmdsOver80}, stale_worktrees=${staleWorktrees}`);
 }
 
 export function buildGcService(config: GcConfig) {
@@ -2064,11 +2119,15 @@ export function buildGcService(config: GcConfig) {
     id: 'openclaw-team-gc',
     start: async (ctx: { logger: { info: (m: string) => void } }) => {
       const statePath = join(config.stateDir, 'tasks.json');
+      const workspacesRoot = join(config.stateDir, '..'); // ~/.openclaw
+
       // Run daily at 03:00 local time
       cron.schedule('0 3 * * *', async () => {
         ctx.logger.info('[openclaw-team-plugin] GC: starting daily cleanup');
         const deleted = await gcHandoffs(config.handoffsDir, config.eventsDir, statePath);
         ctx.logger.info(`[openclaw-team-plugin] GC: deleted ${deleted} expired artifacts`);
+        // Entropy checks folded into same cron (§6.10 — no separate agent needed)
+        await runEntropyChecks(workspacesRoot, ctx.logger);
       });
       ctx.logger.info('[openclaw-team-plugin] GC service started (daily 03:00)');
     },
@@ -2333,11 +2392,12 @@ cd ~/.openclaw/workspace && git add skills/team-orchestrate/SKILL.md && \
 
 ---
 
-### Task 21: Update A2A_PROTOCOL.md and SYSTEM_RULES.md
+### Task 21: Update A2A_PROTOCOL.md, SYSTEM_RULES.md, and SUBAGENT_PACKET_TEMPLATE.md
 
 **Files:**
 - Modify: `~/.openclaw/shared/A2A_PROTOCOL.md`
 - Modify: `~/.openclaw/shared/SYSTEM_RULES.md`
+- Modify: `~/.openclaw/shared/SUBAGENT_PACKET_TEMPLATE.md`
 
 - [ ] **Step 1: Update A2A_PROTOCOL.md status from DRAFT to v3 FINAL**
 ```bash
@@ -2378,9 +2438,40 @@ sed -i '' 's/a2a-dispatcher.*skill/team_dispatch tool (from openclaw-team-plugin
 grep -n "team_dispatch\|a2a-dispatcher" ~/.openclaw/shared/SYSTEM_RULES.md | head -5
 ```
 
-- [ ] **Step 4: Verify both files are valid**
+- [ ] **Step 4: Update SUBAGENT_PACKET_TEMPLATE.md — add TID + callback fields**
+
+Read current template first to find the append point:
 ```bash
-wc -l ~/.openclaw/shared/A2A_PROTOCOL.md ~/.openclaw/shared/SYSTEM_RULES.md
+tail -20 ~/.openclaw/shared/SUBAGENT_PACKET_TEMPLATE.md
+```
+Then append:
+```bash
+cat >> ~/.openclaw/shared/SUBAGENT_PACKET_TEMPLATE.md << 'APPEND'
+
+---
+
+## TID + Callback Fields（openclaw-team-plugin v1+）
+
+Every packet dispatched via `team_dispatch` MUST include:
+
+```yaml
+tid: <YYYYMMDD-HHMMss-<tag>-<4chars>>   # Idempotency key; reuse across pipeline stages for the same feature
+callback_to: main                        # Always report completion back to Q仔
+callback_format: "<STATUS>: <TID> [details]"
+  # STATUS options:
+  #   QA_PASS / QA_FAIL         (李寻欢 → Q仔)
+  #   INFRA_READY / INFRA_REVIEW_OK / INFRA_REVIEW_FAIL  (傅红雪 ↔ Q仔)
+  #   DEPLOY_OK / DEPLOY_FAIL   (傅红雪 → Q仔)
+  #   ACCEPT / REJECT           (花满楼 → Q仔)
+  #   ROLLBACK_OK               (傅红雪 → Q仔)
+ack_required: false  # Only set true for DEPLOY_OK / INFRA_REVIEW_OK / ROLLBACK_OK (state-changing)
+```
+APPEND
+```
+
+- [ ] **Step 5: Verify all three files are valid**
+```bash
+wc -l ~/.openclaw/shared/A2A_PROTOCOL.md ~/.openclaw/shared/SYSTEM_RULES.md ~/.openclaw/shared/SUBAGENT_PACKET_TEMPLATE.md
 ```
 
 ---
@@ -2509,61 +2600,106 @@ mkdir -p ~/.openclaw/bin
 ```bash
 cat > ~/.openclaw/bin/check-agents.sh << 'SCRIPT'
 #!/usr/bin/env bash
-# check-agents.sh — Zero-LLM-cost monitoring heartbeat
+# check-agents.sh — Zero-LLM-cost monitoring heartbeat (spec §2.6)
 # Runs every 10 minutes via system cron. Writes monitor-status.json.
-# Does NOT spawn any LLM agent. Pure shell/process checks.
+# Does NOT spawn any LLM agent. Pure shell/process/GitHub API checks.
+#
+# Alert routing:
+#   - Gateway alive: alert via "openclaw sessions send main <msg>" CLI
+#   - Gateway dead:  alert via macOS osascript notification
+#   - ntfy fallback: if OPENCLAW_NTFY_TOPIC env is set, also push to ntfy
 
 set -euo pipefail
 
 OUTPUT="$HOME/.openclaw/shared/monitor-status.json"
-mkdir -p "$(dirname "$OUTPUT")"
+TASKS_FILE="$HOME/.openclaw/shared/tasks.json"
+mkdir -p "$(dirname "$OUTPUT")" "$HOME/.openclaw/logs"
 
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+alerts=()   # Collect alert messages; sent at end
 
-# Check if openclaw gateway process is running
-gateway_pid=$(pgrep -f "openclaw" 2>/dev/null | head -1 || echo "")
+# ── 1. Gateway liveness ──────────────────────────────────────────────────────
+gateway_pid=$(pgrep -f "openclaw" 2>/dev/null | head -1 || true)
 gateway_ok=$([ -n "$gateway_pid" ] && echo "true" || echo "false")
+[ "$gateway_ok" = "false" ] && alerts+=("ALERT: openclaw gateway is DOWN at $ts")
 
-# Check ACP tmux sessions
+# ── 2. ACP tmux sessions ─────────────────────────────────────────────────────
 builder_acp=$(tmux has-session -t builder-acp 2>/dev/null && echo "true" || echo "false")
 devops_acp=$(tmux has-session -t devops-acp 2>/dev/null && echo "true" || echo "false")
 
-# Check shared dirs exist
-handoffs_dir=$([ -d "$HOME/.openclaw/shared/handoffs" ] && echo "true" || echo "false")
-events_dir=$([ -d "$HOME/.openclaw/shared/events" ] && echo "true" || echo "false")
-worktrees_dir=$([ -d "$HOME/.openclaw/worktrees" ] && echo "true" || echo "false")
+# ── 3. Open PR status (gh CLI) ───────────────────────────────────────────────
+# Check each open TID's PR for CI failures
+pr_failures=()
+if [ -f "$TASKS_FILE" ] && command -v gh &>/dev/null; then
+  open_tids=$(python3 -c "
+import json
+with open('$TASKS_FILE') as f:
+  d = json.load(f)
+for tid, v in d.items():
+  if v.get('status') in ('pending', 'in_progress') and v.get('branch'):
+    print(v['branch'])
+" 2>/dev/null || true)
 
-# Count open tasks from state store
+  for branch in $open_tids; do
+    # Check for failed CI runs on this branch
+    ci_fail=$(gh run list --branch "$branch" --status failure --limit 1 --json databaseId \
+              2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d else 'false')" 2>/dev/null || echo "false")
+    if [ "$ci_fail" = "true" ]; then
+      pr_failures+=("$branch")
+      alerts+=("ALERT: CI failing on branch $branch at $ts")
+    fi
+  done
+fi
+
+# ── 4. Open task count ───────────────────────────────────────────────────────
 open_tasks=0
-tasks_file="$HOME/.openclaw/shared/tasks.json"
-if [ -f "$tasks_file" ]; then
+if [ -f "$TASKS_FILE" ]; then
   open_tasks=$(python3 -c "
-import json, sys
-with open('$tasks_file') as f:
+import json
+with open('$TASKS_FILE') as f:
   d = json.load(f)
 print(sum(1 for v in d.values() if v.get('status') in ('pending', 'in_progress')))
 " 2>/dev/null || echo "0")
 fi
 
-# Write atomic JSON output
+# ── 5. Shared dirs ───────────────────────────────────────────────────────────
+handoffs_dir=$([ -d "$HOME/.openclaw/shared/handoffs" ] && echo "true" || echo "false")
+events_dir=$([ -d "$HOME/.openclaw/shared/events" ] && echo "true" || echo "false")
+worktrees_dir=$([ -d "$HOME/.openclaw/worktrees" ] && echo "true" || echo "false")
+
+# ── 6. Write atomic JSON output ──────────────────────────────────────────────
+pr_failures_json=$(python3 -c "import json; print(json.dumps($( [ ${#pr_failures[@]} -gt 0 ] && printf '%s\n' "${pr_failures[@]}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().splitlines()))' || echo '[]')))" 2>/dev/null || echo "[]")
+
 tmp=$(mktemp "$HOME/.openclaw/shared/.monitor-status.XXXXXX.tmp")
 cat > "$tmp" << JSON
 {
   "ts": "$ts",
   "gateway": { "running": $gateway_ok, "pid": "${gateway_pid:-null}" },
-  "acp_sessions": {
-    "builder_acp": $builder_acp,
-    "devops_acp": $devops_acp
-  },
-  "shared_dirs": {
-    "handoffs": $handoffs_dir,
-    "events": $events_dir,
-    "worktrees": $worktrees_dir
-  },
-  "open_tasks": $open_tasks
+  "acp_sessions": { "builder_acp": $builder_acp, "devops_acp": $devops_acp },
+  "shared_dirs": { "handoffs": $handoffs_dir, "events": $events_dir, "worktrees": $worktrees_dir },
+  "open_tasks": $open_tasks,
+  "ci_failures": $pr_failures_json,
+  "alerts_sent": ${#alerts[@]}
 }
 JSON
 mv "$tmp" "$OUTPUT"
+
+# ── 7. Send alerts ───────────────────────────────────────────────────────────
+for msg in "${alerts[@]}"; do
+  # Primary: openclaw CLI (only if gateway alive)
+  if [ "$gateway_ok" = "true" ]; then
+    openclaw sessions send main "$msg" 2>/dev/null || true
+  fi
+  # Fallback 1: macOS notification
+  if command -v osascript &>/dev/null; then
+    osascript -e "display notification \"$msg\" with title \"openclaw monitor\"" 2>/dev/null || true
+  fi
+  # Fallback 2: ntfy push (if topic configured)
+  if [ -n "${OPENCLAW_NTFY_TOPIC:-}" ]; then
+    curl -s -d "$msg" "https://ntfy.sh/$OPENCLAW_NTFY_TOPIC" &>/dev/null || true
+  fi
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $msg" >> "$HOME/.openclaw/logs/monitor.log"
+done
 SCRIPT
 chmod +x ~/.openclaw/bin/check-agents.sh
 ```
@@ -2573,7 +2709,7 @@ chmod +x ~/.openclaw/bin/check-agents.sh
 ~/.openclaw/bin/check-agents.sh
 cat ~/.openclaw/shared/monitor-status.json | python3 -m json.tool
 ```
-Expected: valid JSON with `gateway`, `acp_sessions`, `shared_dirs`, `open_tasks` fields.
+Expected: valid JSON with `gateway`, `acp_sessions`, `shared_dirs`, `open_tasks`, `ci_failures`, `alerts_sent` fields.
 
 - [ ] **Step 4: Install system cron (every 10 minutes)**
 ```bash
@@ -2619,16 +2755,16 @@ git commit -m "docs: add openclaw agent team implementation plan"
 | 2.3 P2P Visibility | Task 15 |
 | 2.4 State Store (file-locked) | Task 11 |
 | 2.5 Config Override Hierarchy | Task 8 (models.json step) |
-| 2.6 Monitoring Heartbeat | Task 26 (check-agents.sh + system cron) |
+| 2.6 Monitoring Heartbeat | Task 26 (check-agents.sh: process + tmux + PR/CI + alerts) |
 | 2.7 TID Format | Task 10 |
-| 2.7 Git Worktree per Feature | Task 5 (冷燕 SOUL.md) |
-| 2.8 GitHub as Single Source of Truth | Tasks 2–5 (SOUL.md rules) |
-| 2.9 tmux Persistent ACP Sessions | Tasks 4–5 (SOUL.md) |
-| 2.10 Per-Worktree Agent Log | Noted in SOUL.md; full impl deferred (spec says defer) |
-| Q仔 Orchestration Rules | Tasks 5–6, 20 |
-| Agent Role Definitions | Tasks 2–5 |
+| 2.8 Git Worktree per Feature | Task 5 (冷燕 SOUL.md) |
+| 2.9 GitHub as Single Source of Truth | Tasks 2–5 (SOUL.md rules) |
+| 2.10 tmux Persistent ACP Sessions | Tasks 4–5 (SOUL.md) |
+| 2.11 Per-Worktree Agent Log | Noted in SOUL.md; full impl deferred (spec says defer) |
+| Q仔 Orchestration Rules (incl. proactive scanning) | Tasks 5–6, 20 |
+| Agent Role Definitions (incl. 傅红雪 QA gate TID check) | Tasks 2–5 |
 | 6.1 Plugin Interface | Task 18 (index.ts) |
-| 6.2 team_dispatch tool | Task 13 |
+| 6.2 team_dispatch tool (incl. retryContext spec enum) | Task 13 |
 | 6.3 agent:bootstrap hook | Task 14 |
 | 6.4 P2P Visibility Hook | Task 15 |
 | 6.5 ACP Enforcement Hook | Task 16 |
@@ -2637,9 +2773,11 @@ git commit -m "docs: add openclaw agent team implementation plan"
 | 6.7 Per-Agent Tool Whitelist | Noted in SOUL.md; plugin enforcement via 6.5 is the gate |
 | 6.8 Linter as Hard Gate | Not in this plan (requires per-repo linter config — deferred) |
 | 6.9 Skill Security Review Gate | Task 20 references security-reviewer; full impl is a separate skill |
-| 6.10 GC Cron | Task 18 (gc-service.ts) |
+| 6.10 GC Cron + entropy checks | Task 18 (gc-service.ts incl. runEntropyChecks) |
+| 6.11 PR Screenshot Validation Gate | Task 5 Step 4 (冷燕 SOUL.md rule) + deferred GitHub Actions config |
 | 7. Agent ID Migration | Tasks 7–8 |
-| 8. Implementation Phases 1–4 | Tasks 1–25 |
+| Phase 3 Protocol Docs (incl. SUBAGENT_PACKET_TEMPLATE.md) | Tasks 20–21 |
+| 8. Implementation Phases 1–4 | Tasks 1–28 |
 
 **Deferred (out of scope for this plan, per spec Section 9):**
 - Per-worktree `.agent-log.jsonl` (spec says "revisit when simple logs prove insufficient")
