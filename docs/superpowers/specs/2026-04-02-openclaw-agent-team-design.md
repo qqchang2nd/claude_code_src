@@ -65,7 +65,38 @@ Example: `20260402-143012-feat-auth-x7k2`
 
 Second-precision + 4-char random suffix eliminates same-minute collision for parallel spawns. TID is the idempotency key for all dispatch, callback, and handoff operations. Max 3 orchestration rounds per TID (generation counter tracked in state store) to prevent infinite loops.
 
-### 2.6 GitHub as Single Source of Truth
+### 2.6 Git Worktree per Feature
+
+Every new feature or infra change gets its own **git worktree**. This isolates work-in-progress across parallel tasks and prevents branch context pollution in the main checkout.
+
+**Convention (冷燕):**
+```bash
+# On task receive
+git worktree add ~/.openclaw/worktrees/<TID> -b feat/<TID>
+
+# Work entirely inside the worktree (tmux session cd's here)
+cd ~/.openclaw/worktrees/<TID>
+
+# When done: commit, push, open PR
+git push origin feat/<TID>
+gh pr create --title "..." --body "..."
+
+# Worktree removed after PR merge (傅红雪 or Q仔 triggers cleanup)
+git worktree remove ~/.openclaw/worktrees/<TID>
+```
+
+**Convention (傅红雪):**
+```bash
+git worktree add ~/.openclaw/worktrees/infra-<TID> -b infra/<TID>
+```
+
+**Rules:**
+- One worktree per TID. Worktree path is `~/.openclaw/worktrees/<TID>`.
+- The tmux ACP session always operates inside the task's worktree, not the main checkout.
+- Worktree is created at task start, removed only after PR is merged (not before).
+- If a task is abandoned (L3 escalation, cancelled), worktree is archived to `~/.openclaw/worktrees/archived/<TID>` for post-mortem, not deleted.
+
+### 2.7 GitHub as Single Source of Truth
 
 **GitHub is the canonical truth for all durable artifacts.** No artifact is considered "done" until it exists in a GitHub repository.
 
@@ -84,7 +115,7 @@ Second-precision + 4-char random suffix eliminates same-minute collision for par
 - No "it works locally" handoffs. If it's not in GitHub, it doesn't exist.
 - Q仔 treats the PR URL as the authoritative reference for any task's output.
 
-### 2.7 tmux Persistent ACP Sessions
+### 2.8 tmux Persistent ACP Sessions
 
 `sessions_spawn` with `runtime: "acp"` spawns a one-shot process. For agents that need multi-step edit-run-verify loops (冷燕, 傅红雪), a **persistent tmux session** is required to maintain file system state, git context, and ACP process across turns.
 
@@ -246,12 +277,14 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 - 测试类型：单元测试 + 集成测试（针对 API/数据库操作）。
 
 ## 编码执行约束（强制）
-- 凡写代码/改代码：必须在 **tmux session `builder-acp`** 中通过 Claude Code 或 Gemini CLI 执行。
-- tmux session 常驻，不在任务间销毁。收到任务时检查 session 是否存在，不存在则创建。
-- 禁止在非 ACP 的普通对话/子代理模式里直接产出大段实现代码；
-  必须通过 ACP 落地，并在 closeout 给出 PR URL + commit SHA。
-- ACP 执行完成后，必须 commit + push + 开 PR，然后将 PR URL + commit SHA 写入 handoff artifact。
-- **没有 PR = 没有完成。** 不接受"本地已改好"的 handoff。
+- 每个新功能/修复：先创建 git worktree（`~/.openclaw/worktrees/<TID>`，分支 `feat/<TID>`）。
+- 所有编码在 worktree 内进行，不在 main checkout 里工作。
+- 必须在 **tmux session `builder-acp`** 中通过 Claude Code 或 Gemini CLI 执行，tmux session cd 到对应 worktree。
+- tmux session 常驻，不在任务间销毁；每次新任务 cd 到新 worktree。
+- 禁止在非 ACP 的普通对话/子代理模式里直接产出大段实现代码。
+- ACP 执行完成后，必须 commit + push + 开 PR，将 PR URL + commit SHA 写入 handoff artifact。
+- PR merge 后由 Q仔/傅红雪 触发 worktree 清理。
+- **没有 PR = 没有完成。**
 ```
 
 **Plugin enforcement:** PreToolUse hook in `openclaw-team-plugin` intercepts `exec`/`write`/`edit` tool calls from builder in non-ACP sessions and rejects them.
@@ -345,9 +378,11 @@ If 李寻欢 is unresponsive after 3 retries (with exponential backoff):
 - 响应部署失败和告警
 
 ## 编码执行约束（强制）
-- 凡修改基础设施配置/脚本：必须在 **tmux session `devops-acp`** 中通过 Claude Code 或 Gemini CLI 执行。
+- 每个 infra 变更：先创建 git worktree（`~/.openclaw/worktrees/infra-<TID>`，分支 `infra/<TID>`）。
+- 所有配置修改在 worktree 内进行。
+- 必须在 **tmux session `devops-acp`** 中通过 Claude Code 或 Gemini CLI 执行，tmux session cd 到对应 worktree。
 - tmux session 常驻，不在任务间销毁。
-- 例外：只读操作（查看 dashboard、读取日志）无需 ACP。
+- 例外：只读操作（查看 dashboard、读取日志）无需 ACP 和 worktree。
 - 配置产出后必须 commit + push 到 infra repo，开 PR，然后 sessions_send Q仔 "INFRA_READY: <TID> <PR_URL>"。
 - 李寻欢 对 PR diff 做 infra review（不是本地文件）。
 - 收到 INFRA_REVIEW_OK 后，在 tmux session 中执行部署，并将 rollback 命令写入 handoff artifact。
