@@ -71,23 +71,21 @@
 - Read: `~/.openclaw/workspace-ko/SOUL.md`
 - Read: `~/.openclaw/workspace-ops/SOUL.md`
 
-- [ ] **Step 1: Back up ko workspace**
+- [ ] **Step 1: Capture timestamp and back up both workspaces**
 ```bash
-cp -r ~/.openclaw/workspace-ko ~/.openclaw/workspace-ko.BAK-$(date +%Y%m%d-%H%M%S)
-echo "Backed up to ~/.openclaw/workspace-ko.BAK-$(date +%Y%m%d-%H%M%S)"
+# Capture once — both backups share the same tag to make verification reliable
+BAKTAG=$(date +%Y%m%d-%H%M%S)
+cp -r ~/.openclaw/workspace-ko ~/.openclaw/workspace-ko.BAK-$BAKTAG
+cp -r ~/.openclaw/workspace-ops ~/.openclaw/workspace-ops.BAK-$BAKTAG
+echo "Backed up with tag: $BAKTAG"
 ```
 
-- [ ] **Step 2: Back up ops workspace**
+- [ ] **Step 2: Verify both backups exist**
 ```bash
-cp -r ~/.openclaw/workspace-ops ~/.openclaw/workspace-ops.BAK-$(date +%Y%m%d-%H%M%S)
-echo "Backed up"
+BAKTAG=$(ls ~/.openclaw/ | grep 'workspace-ko.BAK' | head -1 | sed 's/workspace-ko.BAK-//')
+ls ~/.openclaw/ | grep -E "workspace-(ko|ops)\.BAK-$BAKTAG"
 ```
-
-- [ ] **Step 3: Verify backups exist**
-```bash
-ls ~/.openclaw/ | grep -E "workspace-(ko|ops)\.BAK"
-```
-Expected: two `.BAK-*` entries listed.
+Expected: two entries with the same timestamp tag.
 
 ---
 
@@ -463,6 +461,17 @@ rules:
 - 核心 SOUL.md 控制在约 60 行以内（目录，非百科全书）。
 - 详细规则移入 `RULES/` 子目录（如 `RULES/qa-gate.md`）。
 - Q仔 在 dispatch 时根据任务类型注入相关 RULES/ 文件到子 agent 上下文。
+
+## 主动扫描例程（proactive scanning）
+Q仔 接收到确定性脚本的 sessions_send 触发时，自动执行对应例程（不需要用户开口）：
+
+| 触发信号 | 来源脚本 | Q仔 动作 |
+|---------|---------|---------|
+| `SENTRY_ERRORS: <count> issues` | `scan-sentry.sh`（每日晨间） | 评估优先级 → dispatch 李寻欢分析 → 视严重度 dispatch 冷燕 |
+| `MEETING_ACTIONS: <summary>` | `scan-meetings.sh`（会后触发） | 解析行动项 → 分配到相关 agent |
+| `CHANGELOG_TRIGGER: <since>` | `gen-changelog.sh`（每日晚间） | dispatch 高老大 或 直接生成 changelog，push PR |
+
+扫描脚本（外部 cron，零 LLM 成本）位于 `~/.openclaw/bin/`，由系统 cron 调度，结果通过 sessions_send 发给 Q仔。
 APPEND
 ```
 
@@ -503,6 +512,20 @@ cat >> ~/.openclaw/workspace-cto/SOUL.md << 'APPEND'
 ## 架构决策分级
 - L1（单服务内）/ L2（跨服务接口）：自主决定
 - L3（多仓库 / 基础设施）：需 L3 升级，阻塞等人工
+
+## 多模型 QA Review（成本门控）
+QA gate 使用三个 reviewer，顺序固定，前置 B 门控后续两者：
+
+| 角色 | 模型 | 侧重 | 触发条件 |
+|------|------|------|---------|
+| Reviewer B（宽度+成本门控）| Gemini Flash（免费额度）| 代码覆盖率、快速回归 | **始终先跑** |
+| Reviewer A（深度）| Claude Sonnet 4.6 | 架构合理性、安全漏洞 | B 通过后触发 |
+| Reviewer C（验证）| Codex（细节校对）| 类型一致性、边界条件 | A 通过后触发 |
+
+合并规则：
+- 任何 reviewer 报告 CRITICAL → 直接 QA_FAIL，不等其他 reviewer。
+- 2+ reviewers 报告同一 HIGH → 提升为 CRITICAL。
+- 仅 1 reviewer 报告 HIGH → 保持 HIGH，列入修改建议但不阻塞。
 APPEND
 ```
 
@@ -526,6 +549,11 @@ cat >> ~/.openclaw/workspace-builder/SOUL.md << 'APPEND'
 - 凡写代码/改代码：必须同时写测试，覆盖率 ≥80%。
 - 测试先行（TDD）：先写失败测试，再写实现，再重构。
 - 测试类型：单元测试 + 集成测试（针对 API/数据库操作）。
+
+## UI 变更截图（DoD 强制）
+- 任何涉及 UI 文件（`*.tsx`, `*.vue`, `*.css`, `*.html`）的 PR，**PR description 必须包含 before/after 截图**。
+- 截图缺失 → CI 直接 fail（由 PR validation gate 机械执行，无需 LLM 判断）。
+- 截图工具：优先 `playwright screenshot`，fallback `browser-use`。
 APPEND
 ```
 
@@ -588,18 +616,34 @@ tail -20 ~/.openclaw/workspace/AGENTS.md
 
 This task uses Python to safely update the JSON. Do NOT hand-edit the JSON file.
 
-- [ ] **Step 1: Backup openclaw.json**
+> **Gateway must be stopped before mutation** (Finding 12). The write must be atomic to prevent partial-JSON reads if the gateway auto-reloads.
+
+- [ ] **Step 1: Stop gateway**
+```bash
+openclaw stop && sleep 2
+echo "Gateway stopped"
+```
+
+- [ ] **Step 2: Backup openclaw.json**
 ```bash
 cp ~/.openclaw/openclaw.json ~/.openclaw/openclaw.json.bak.$(date +%Y%m%d-%H%M%S)
 ```
 
-- [ ] **Step 2: Run update script**
+- [ ] **Step 3: Check whether niuniu is still needed**
+```bash
+# Determine if niuniu is an active agent or deprecated
+grep -r '"niuniu"' ~/.openclaw/agents/ ~/.openclaw/openclaw.json 2>/dev/null | head -10
+```
+If `niuniu` has active session state in `~/.openclaw/agents/niuniu/`, add it to `new_allowed` in the next step. If it's only referenced in `allowAgents` arrays and has no workspace, it is safe to drop (and this is intentional cleanup — document below).
+
+- [ ] **Step 4: Run atomic update script**
 
 ```bash
 python3 << 'SCRIPT'
-import json, copy
+import json, os, tempfile
 
-with open('/Users/qqzhang/.openclaw/openclaw.json', 'r') as f:
+path = '/Users/qqzhang/.openclaw/openclaw.json'
+with open(path, 'r') as f:
     d = json.load(f)
 
 agents = d.get('agents', {})
@@ -612,7 +656,7 @@ for a in lst:
         a['name'] = '花满楼'
         a['workspace'] = '/Users/qqzhang/.openclaw/workspace-pm'
         a['identity'] = {'name': '花满楼', 'theme': '产品经理｜需求把关、验收负责', 'emoji': '🌸'}
-        a.pop('model', None)  # Use default model
+        a.pop('model', None)
 
 # 2. Rename ops → biz
 for a in lst:
@@ -638,13 +682,13 @@ for a in lst:
     if a.get('id') == 'cio':
         a.setdefault('identity', {})['theme'] = '投资分析师 & 市场观察者'
 
-# 5. Update subagents.allowAgents in all entries and main
+# 5. Update subagents.allowAgents
+# NOTE: 'niuniu' is intentionally dropped — it has no workspace and is deprecated.
+# If niuniu is still needed, add it back to new_allowed here.
 new_allowed = ['research', 'builder', 'cio', 'pm', 'biz', 'devops', 'cto']
 for a in lst:
     if 'subagents' in a and 'allowAgents' in a['subagents']:
         a['subagents']['allowAgents'] = new_allowed
-
-# Also update main agent (first entry or id=main)
 for a in lst:
     if a.get('id') == 'main':
         a.setdefault('subagents', {})['allowAgents'] = new_allowed
@@ -652,11 +696,27 @@ for a in lst:
 agents['list'] = lst
 d['agents'] = agents
 
-with open('/Users/qqzhang/.openclaw/openclaw.json', 'w') as f:
-    json.dump(d, f, indent=2, ensure_ascii=False)
-    f.write('\n')
+# 6. Update Slack + Feishu bindings for renamed agents (Finding 14)
+for b in d.get('bindings', []):
+    if b.get('agentId') == 'ko':
+        b['agentId'] = 'pm'
+    if b.get('agentId') == 'ops':
+        b['agentId'] = 'biz'
+# Also update bindings nested under channel configs if present
+for ch_name, ch_val in d.get('channels', {}).items():
+    for b in ch_val.get('bindings', []) if isinstance(ch_val, dict) else []:
+        if b.get('agentId') == 'ko': b['agentId'] = 'pm'
+        if b.get('agentId') == 'ops': b['agentId'] = 'biz'
 
-print('openclaw.json updated successfully')
+# 7. Atomic write: write to temp file then rename (POSIX atomic)
+dir_ = os.path.dirname(path)
+with tempfile.NamedTemporaryFile('w', dir=dir_, delete=False, suffix='.tmp') as tf:
+    json.dump(d, tf, indent=2, ensure_ascii=False)
+    tf.write('\n')
+    tmp_path = tf.name
+os.rename(tmp_path, path)
+
+print('openclaw.json updated successfully (atomic write)')
 SCRIPT
 ```
 
@@ -747,8 +807,9 @@ echo "Shared dirs ready"
 
 - [ ] **Step 6: Restart openclaw gateway and verify agents load**
 ```bash
-# Stop and restart gateway
-openclaw stop && sleep 2 && openclaw start
+# Gateway was already stopped in Task 7 Step 1 before the openclaw.json mutation.
+# Just start it here — do NOT stop again (that would interrupt any restored state).
+openclaw start
 # Wait for startup
 sleep 3
 # Verify agents are registered (adjust command if openclaw has a different status command)
@@ -1061,6 +1122,14 @@ export interface TaskEntry {
   completedAt?: string;
   tid?: string;
   orchestratorViolations?: number;
+  // Execution context (single source of truth — no separate active-tasks.json)
+  tmuxSession?: string;   // e.g. 'builder-acp' or 'devops-acp'
+  worktree?: string;      // e.g. '~/.openclaw/worktrees/<TID>'
+  branch?: string;        // e.g. 'feat/<TID>'
+  prUrl?: string;         // GitHub PR URL once opened
+  checks?: {              // CI check results keyed by check name
+    [checkName: string]: 'pending' | 'pass' | 'fail';
+  };
 }
 
 export type StateStore = Record<string, TaskEntry>;
@@ -1153,10 +1222,30 @@ export async function readHandoff(handoffsDir: string, tid: string): Promise<str
   return readFile(path, 'utf8');
 }
 
-export async function gcHandoffs(handoffsDir: string, eventsDir: string): Promise<number> {
+/**
+ * GC handoff + event files that are older than TTL.
+ *
+ * Age is measured from `completedAt` in the state store (canonical source of truth),
+ * NOT from file mtime. mtime resets on every write, causing GC to miss completed tasks.
+ * Falls back to file mtime only for files with no matching TID in the state store.
+ */
+export async function gcHandoffs(
+  handoffsDir: string,
+  eventsDir: string,
+  statePath: string
+): Promise<number> {
   const now = Date.now();
   const ttlMs = 24 * 60 * 60 * 1000; // 24h after task completion
   let deleted = 0;
+
+  // Load state store for completedAt lookups
+  let stateStore: Record<string, { completedAt?: string }> = {};
+  try {
+    const raw = await readFile(statePath, 'utf8');
+    stateStore = JSON.parse(raw);
+  } catch {
+    // State file missing — use mtime as fallback for all files
+  }
 
   const dirs = [expandHome(handoffsDir), expandHome(eventsDir)];
   for (const dir of dirs) {
@@ -1167,11 +1256,23 @@ export async function gcHandoffs(handoffsDir: string, eventsDir: string): Promis
       continue;
     }
     for (const file of files) {
-      const filePath = join(dir, file);
-      const s = await stat(filePath).catch(() => null);
-      if (!s) continue;
-      const age = now - s.mtimeMs;
-      if (age > ttlMs) {
+      // Extract TID from filename (e.g. "20260402-143012-feat-auth-x7k2.md")
+      const tid = file.replace(/\.[^.]+$/, '');
+      const entry = stateStore[tid];
+
+      let ageMs: number;
+      if (entry?.completedAt) {
+        ageMs = now - new Date(entry.completedAt).getTime();
+      } else {
+        // Fallback to mtime if TID not in state (e.g. orphaned files)
+        const filePath = join(dir, file);
+        const s = await stat(filePath).catch(() => null);
+        if (!s) continue;
+        ageMs = now - s.mtimeMs;
+      }
+
+      if (ageMs > ttlMs) {
+        const filePath = join(dir, file);
         await rm(filePath).catch(() => {});
         deleted++;
       }
@@ -1265,6 +1366,14 @@ interface ToolConfig {
   eventsDir: string;
 }
 
+interface RetryContext {
+  failureType: 'timeout' | 'qa_fail' | 'infra_fail' | 'budget_exceeded' | 'unknown';
+  scopeNarrow?: string;          // How the retry scope is reduced vs original
+  originalRequirement?: string;  // Copy of the original task text
+  additionalContext?: string;    // Extra info gathered from the failure
+  previousAttemptTid?: string;   // TID of the failed attempt
+}
+
 interface DispatchParams {
   agentId: string;
   task: string;
@@ -1275,6 +1384,7 @@ interface DispatchParams {
   escalation_trigger?: Record<string, string>;
   max_cost_usd?: number;
   model?: string;
+  retryContext?: RetryContext;   // Populate on retry dispatches only
 }
 
 export function buildTeamDispatchTool(config: ToolConfig) {
@@ -1299,6 +1409,18 @@ export function buildTeamDispatchTool(config: ToolConfig) {
         escalation_trigger: { type: 'object', description: 'Condition to promote deterministic → agentic' },
         max_cost_usd: { type: 'number', description: 'Budget cap; auto-escalate L2 when exceeded' },
         model: { type: 'string', description: 'Explicit model override for this dispatch. Rule-based only.' },
+        retryContext: {
+          type: 'object',
+          description: 'Structured context for retry dispatches. Omit on first attempt.',
+          properties: {
+            failureType: { type: 'string', enum: ['timeout', 'qa_fail', 'infra_fail', 'budget_exceeded', 'unknown'] },
+            scopeNarrow: { type: 'string' },
+            originalRequirement: { type: 'string' },
+            additionalContext: { type: 'string' },
+            previousAttemptTid: { type: 'string' },
+          },
+          required: ['failureType'],
+        },
       },
     },
     handler: async (params: DispatchParams): Promise<string> => {
@@ -1328,6 +1450,9 @@ export function buildTeamDispatchTool(config: ToolConfig) {
           `**Node type:** ${p.nodeType ?? 'agentic'}`,
           p.model ? `**Model override:** ${p.model}` : '',
           p.max_cost_usd ? `**Budget cap:** $${p.max_cost_usd}` : '',
+          p.retryContext ? `**Retry:** failureType=${p.retryContext.failureType}` +
+            (p.retryContext.previousAttemptTid ? `, prevTid=${p.retryContext.previousAttemptTid}` : '') +
+            (p.retryContext.scopeNarrow ? `\n**Scope narrow:** ${p.retryContext.scopeNarrow}` : '') : '',
         ].filter(Boolean).join('\n'),
       });
 
@@ -1489,7 +1614,77 @@ git -C ~/.openclaw/extensions/openclaw-team-plugin commit -m "feat: soul-bootstr
 **Files:**
 - Create: `~/.openclaw/extensions/openclaw-team-plugin/src/hooks/p2p-event-log.ts`
 
-- [ ] **Step 1: Implement p2p-event-log.ts**
+- [ ] **Step 1: Write failing test for TID extraction**
+```bash
+cat > ~/.openclaw/extensions/openclaw-team-plugin/tests/p2p-event-log.test.ts << 'TEST'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { buildP2pEventLogHook } from '../src/hooks/p2p-event-log.js';
+import { mkdtemp, rm, readdir, readFile } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+
+let eventsDir: string;
+
+beforeEach(async () => {
+  eventsDir = await mkdtemp(join(tmpdir(), 'p2p-test-'));
+});
+
+afterEach(async () => {
+  await rm(eventsDir, { recursive: true });
+});
+
+describe('buildP2pEventLogHook', () => {
+  it('ignores non-sessions_send tool calls', async () => {
+    const hook = buildP2pEventLogHook({ eventsDir });
+    await hook({ toolName: 'read', params: {}, result: 'ok' }, { agentId: 'main' });
+    const files = await readdir(eventsDir);
+    expect(files).toHaveLength(0);
+  });
+
+  it('extracts TID from "TID: <tid>" pattern and writes JSONL', async () => {
+    const hook = buildP2pEventLogHook({ eventsDir });
+    await hook(
+      { toolName: 'sessions_send', params: { target: 'builder', message: 'TID: 20260402-143012-feat-auth-x7k2 please implement' } },
+      { agentId: 'main' }
+    );
+    const files = await readdir(eventsDir);
+    expect(files).toEqual(['20260402-143012-feat-auth-x7k2.jsonl']);
+    const content = await readFile(join(eventsDir, files[0]), 'utf8');
+    const record = JSON.parse(content.trim());
+    expect(record.from).toBe('main');
+    expect(record.to).toBe('builder');
+  });
+
+  it('extracts TID from bare TID format in message', async () => {
+    const hook = buildP2pEventLogHook({ eventsDir });
+    await hook(
+      { toolName: 'sessions_send', params: { target: 'cto', message: 'QA_PASS: 20260402-150000-fix-bug-ab12 done' } },
+      { agentId: 'builder' }
+    );
+    const files = await readdir(eventsDir);
+    expect(files).toEqual(['20260402-150000-fix-bug-ab12.jsonl']);
+  });
+
+  it('falls back to unknown TID when no TID in message', async () => {
+    const hook = buildP2pEventLogHook({ eventsDir });
+    await hook(
+      { toolName: 'sessions_send', params: { target: 'main', message: 'hello no tid here' } },
+      { agentId: 'research' }
+    );
+    const files = await readdir(eventsDir);
+    expect(files).toEqual(['unknown.jsonl']);
+  });
+});
+TEST
+```
+
+- [ ] **Step 2: Run test — expect FAIL**
+```bash
+cd ~/.openclaw/extensions/openclaw-team-plugin && npx vitest run tests/p2p-event-log.test.ts
+```
+Expected: fails with "Cannot find module".
+
+- [ ] **Step 3: Implement p2p-event-log.ts**
 
 This is a simple `after_tool_call` hook. No blocking. Append to JSONL.
 ```bash
@@ -1536,10 +1731,16 @@ export function buildP2pEventLogHook(config: Config) {
 SRC
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 4: Run test — expect PASS**
 ```bash
-git -C ~/.openclaw/extensions/openclaw-team-plugin add src/hooks/p2p-event-log.ts
-git -C ~/.openclaw/extensions/openclaw-team-plugin commit -m "feat: P2P event log hook (after_tool_call on sessions_send)"
+cd ~/.openclaw/extensions/openclaw-team-plugin && npx vitest run tests/p2p-event-log.test.ts
+```
+Expected: all tests green.
+
+- [ ] **Step 5: Commit**
+```bash
+git -C ~/.openclaw/extensions/openclaw-team-plugin add src/hooks/p2p-event-log.ts tests/p2p-event-log.test.ts
+git -C ~/.openclaw/extensions/openclaw-team-plugin commit -m "feat: P2P event log hook + TID extraction tests"
 ```
 
 ---
@@ -1771,27 +1972,102 @@ git -C ~/.openclaw/extensions/openclaw-team-plugin commit -m "feat: orchestrator
 
 **Files:**
 - Create: `~/.openclaw/extensions/openclaw-team-plugin/src/gc/gc-service.ts`
+- Create: `~/.openclaw/extensions/openclaw-team-plugin/tests/gc-service.test.ts`
 - Create: `~/.openclaw/extensions/openclaw-team-plugin/index.ts`
 
-- [ ] **Step 1: Implement gc-service.ts**
+- [ ] **Step 1: Write failing GC test**
+```bash
+cat > ~/.openclaw/extensions/openclaw-team-plugin/tests/gc-service.test.ts << 'TEST'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { gcHandoffs } from '../src/team-dispatch/handoff.js';
+import { mkdtemp, rm, writeFile, mkdir } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+
+let handoffsDir: string;
+let eventsDir: string;
+let stateDir: string;
+
+beforeEach(async () => {
+  const base = await mkdtemp(join(tmpdir(), 'gc-test-'));
+  handoffsDir = join(base, 'handoffs');
+  eventsDir = join(base, 'events');
+  stateDir = base;
+  await mkdir(handoffsDir, { recursive: true });
+  await mkdir(eventsDir, { recursive: true });
+});
+
+afterEach(async () => {
+  await rm(stateDir, { recursive: true });
+});
+
+describe('gcHandoffs', () => {
+  it('deletes files whose completedAt is older than 24h', async () => {
+    const tid = '20260401-000000-old-task-aaaa';
+    const statePath = join(stateDir, 'tasks.json');
+    // completedAt > 24h ago
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    await writeFile(statePath, JSON.stringify({ [tid]: { status: 'done', agentId: 'builder', createdAt: old, completedAt: old } }));
+    await writeFile(join(handoffsDir, `${tid}.md`), '# test');
+
+    const deleted = await gcHandoffs(handoffsDir, eventsDir, statePath);
+    expect(deleted).toBe(1);
+  });
+
+  it('keeps files whose completedAt is less than 24h ago', async () => {
+    const tid = '20260402-120000-new-task-bbbb';
+    const statePath = join(stateDir, 'tasks.json');
+    const recent = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(); // 1h ago
+    await writeFile(statePath, JSON.stringify({ [tid]: { status: 'done', agentId: 'cto', createdAt: recent, completedAt: recent } }));
+    await writeFile(join(handoffsDir, `${tid}.md`), '# test');
+
+    const deleted = await gcHandoffs(handoffsDir, eventsDir, statePath);
+    expect(deleted).toBe(0);
+  });
+
+  it('uses mtime fallback for orphaned files not in state store', async () => {
+    const statePath = join(stateDir, 'tasks.json');
+    await writeFile(statePath, JSON.stringify({})); // empty state
+    // Write a file and manually set mtime via atime trick is not reliable in tests,
+    // so just verify it does not crash and returns 0 for a fresh file.
+    const orphanFile = join(handoffsDir, 'unknown-orphan.md');
+    await writeFile(orphanFile, '# orphan');
+
+    const deleted = await gcHandoffs(handoffsDir, eventsDir, statePath);
+    expect(deleted).toBe(0); // just created, mtime is recent
+  });
+});
+TEST
+```
+
+- [ ] **Step 2: Run GC test — expect FAIL**
+```bash
+cd ~/.openclaw/extensions/openclaw-team-plugin && npx vitest run tests/gc-service.test.ts
+```
+Expected: fails — gcHandoffs signature does not yet accept statePath.
+
+- [ ] **Step 3: Implement gc-service.ts**
 ```bash
 cat > ~/.openclaw/extensions/openclaw-team-plugin/src/gc/gc-service.ts << 'SRC'
 import cron from 'node-cron';
 import { gcHandoffs } from '../team-dispatch/handoff.js';
+import { join } from 'path';
 
 interface GcConfig {
   handoffsDir: string;
   eventsDir: string;
+  stateDir: string;
 }
 
 export function buildGcService(config: GcConfig) {
   return {
     id: 'openclaw-team-gc',
     start: async (ctx: { logger: { info: (m: string) => void } }) => {
+      const statePath = join(config.stateDir, 'tasks.json');
       // Run daily at 03:00 local time
       cron.schedule('0 3 * * *', async () => {
         ctx.logger.info('[openclaw-team-plugin] GC: starting daily cleanup');
-        const deleted = await gcHandoffs(config.handoffsDir, config.eventsDir);
+        const deleted = await gcHandoffs(config.handoffsDir, config.eventsDir, statePath);
         ctx.logger.info(`[openclaw-team-plugin] GC: deleted ${deleted} expired artifacts`);
       });
       ctx.logger.info('[openclaw-team-plugin] GC service started (daily 03:00)');
@@ -1801,7 +2077,12 @@ export function buildGcService(config: GcConfig) {
 SRC
 ```
 
-- [ ] **Step 2: Write index.ts**
+- [ ] **Step 4: Run GC test — expect PASS**
+```bash
+cd ~/.openclaw/extensions/openclaw-team-plugin && npx vitest run tests/gc-service.test.ts
+```
+
+- [ ] **Step 5: Write index.ts**
 ```bash
 cat > ~/.openclaw/extensions/openclaw-team-plugin/index.ts << 'SRC'
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
@@ -1840,9 +2121,20 @@ export default {
     const dispatchTool = buildTeamDispatchTool({ stateDir, handoffsDir, eventsDir });
     api.registerTool(dispatchTool as any);
 
-    // 2. SOUL injection at agent start
+    // 2+5. Combine SOUL injection + orchestrator warning into ONE before_agent_start handler.
+    // Two separate hooks both returning prependContext may cause openclaw to use only the last one.
+    // Merging them ensures both prependContext values are always concatenated.
     const soulHook = buildSoulBootstrapHook({ workspacesRoot });
-    api.registerHook('before_agent_start', soulHook as any);
+    const warnHooks = buildOrchestratorWarnHooks();
+    api.registerHook('before_agent_start', async (event: any, ctx: any) => {
+      const [soulResult, warnResult] = await Promise.all([
+        soulHook(event, ctx),
+        warnHooks.beforeAgentStart(event, ctx),
+      ]);
+      const parts = [soulResult?.prependContext, warnResult?.prependContext].filter(Boolean);
+      if (parts.length === 0) return undefined;
+      return { prependContext: parts.join('\n\n---\n\n') };
+    });
 
     // 3. P2P event log (after sessions_send calls)
     const p2pHook = buildP2pEventLogHook({ eventsDir });
@@ -1852,13 +2144,11 @@ export default {
     const acpHook = buildAcpEnforceHook();
     api.registerHook('before_tool_call', acpHook as any);
 
-    // 5. Orchestrator soft-warning (Q仔 bypassing team)
-    const warnHooks = buildOrchestratorWarnHooks();
+    // 5b. Orchestrator violation counter (after_tool_call side — separate from before_agent_start)
     api.registerHook('after_tool_call', warnHooks.afterToolCall as any);
-    api.registerHook('before_agent_start', warnHooks.beforeAgentStart as any);
 
     // 6. GC service (daily 03:00)
-    const gcService = buildGcService({ handoffsDir, eventsDir });
+    const gcService = buildGcService({ handoffsDir, eventsDir, stateDir });
     api.registerService(gcService as any);
 
     (api as any).logger?.info?.('[openclaw-team-plugin] Registered: team_dispatch + 4 hooks + GC service');
@@ -1867,16 +2157,16 @@ export default {
 SRC
 ```
 
-- [ ] **Step 3: Run all tests**
+- [ ] **Step 6: Run all tests**
 ```bash
 cd ~/.openclaw/extensions/openclaw-team-plugin && npx vitest run --coverage
 ```
 Expected: all test files pass, coverage ≥80%.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 7: Commit**
 ```bash
-git -C ~/.openclaw/extensions/openclaw-team-plugin add src/gc/gc-service.ts index.ts
-git -C ~/.openclaw/extensions/openclaw-team-plugin commit -m "feat: GC service + wire all hooks in index.ts"
+git -C ~/.openclaw/extensions/openclaw-team-plugin add src/gc/gc-service.ts tests/gc-service.test.ts index.ts
+git -C ~/.openclaw/extensions/openclaw-team-plugin commit -m "feat: GC service (uses completedAt from state) + wire all hooks in index.ts"
 ```
 
 ---
@@ -1886,12 +2176,21 @@ git -C ~/.openclaw/extensions/openclaw-team-plugin commit -m "feat: GC service +
 **Files:**
 - Modify: `~/.openclaw/openclaw.json` (add plugin to allow list + entries)
 
-- [ ] **Step 1: Add plugin to openclaw.json**
+> **Gateway must be stopped before mutation** (same rule as Task 7). Use atomic write.
+
+- [ ] **Step 1: Stop gateway**
+```bash
+openclaw stop && sleep 2
+echo "Gateway stopped"
+```
+
+- [ ] **Step 2: Add plugin to openclaw.json (atomic write)**
 ```bash
 python3 << 'SCRIPT'
-import json
+import json, os, tempfile
 
-with open('/Users/qqzhang/.openclaw/openclaw.json', 'r') as f:
+path = '/Users/qqzhang/.openclaw/openclaw.json'
+with open(path, 'r') as f:
     d = json.load(f)
 
 plugins = d.setdefault('plugins', {})
@@ -1912,22 +2211,26 @@ entries['openclaw-team-plugin'] = {
     }
 }
 
-with open('/Users/qqzhang/.openclaw/openclaw.json', 'w') as f:
-    json.dump(d, f, indent=2, ensure_ascii=False)
-    f.write('\n')
+# Atomic write: write to temp then rename (POSIX atomic)
+dir_ = os.path.dirname(path)
+with tempfile.NamedTemporaryFile('w', dir=dir_, delete=False, suffix='.tmp') as tf:
+    json.dump(d, tf, indent=2, ensure_ascii=False)
+    tf.write('\n')
+    tmp_path = tf.name
+os.rename(tmp_path, path)
 
-print('Plugin registered in openclaw.json')
+print('Plugin registered in openclaw.json (atomic write)')
 SCRIPT
 ```
 
-- [ ] **Step 2: Validate JSON**
+- [ ] **Step 3: Validate JSON**
 ```bash
 python3 -m json.tool ~/.openclaw/openclaw.json > /dev/null && echo "JSON valid"
 ```
 
-- [ ] **Step 3: Restart gateway and verify plugin loads**
+- [ ] **Step 4: Restart gateway and verify plugin loads**
 ```bash
-openclaw stop && sleep 2 && openclaw start
+openclaw start
 sleep 3
 openclaw status 2>/dev/null | grep -i "team-plugin\|team_dispatch" || \
   grep -i "team-plugin\|registered" ~/.openclaw/logs/*.log 2>/dev/null | tail -5 || \
@@ -1936,7 +2239,7 @@ openclaw status 2>/dev/null | grep -i "team-plugin\|team_dispatch" || \
 
 Expected: log line containing `[openclaw-team-plugin] Registered` or similar.
 
-- [ ] **Step 4: Verify team_dispatch tool is available in Q仔 session**
+- [ ] **Step 5: Verify team_dispatch tool is available in Q仔 session**
 
 Open Q仔 session and run:
 ```
@@ -2189,7 +2492,107 @@ rm -f /tmp/test-orch-warn.txt
 
 ---
 
-### Task 26: Commit plan and spec to claude_code_src repo
+### Task 26: Create monitoring heartbeat + system cron
+
+This implements Section 2.6 of the spec: a zero-LLM-cost shell script that runs every 10 minutes and writes `monitor-status.json`. It does NOT spawn any agent — it just checks process/session liveness.
+
+**Files:**
+- Create: `~/.openclaw/bin/check-agents.sh`
+- Modify: user's system crontab (once, during setup)
+
+- [ ] **Step 1: Create ~/.openclaw/bin directory**
+```bash
+mkdir -p ~/.openclaw/bin
+```
+
+- [ ] **Step 2: Write check-agents.sh**
+```bash
+cat > ~/.openclaw/bin/check-agents.sh << 'SCRIPT'
+#!/usr/bin/env bash
+# check-agents.sh — Zero-LLM-cost monitoring heartbeat
+# Runs every 10 minutes via system cron. Writes monitor-status.json.
+# Does NOT spawn any LLM agent. Pure shell/process checks.
+
+set -euo pipefail
+
+OUTPUT="$HOME/.openclaw/shared/monitor-status.json"
+mkdir -p "$(dirname "$OUTPUT")"
+
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Check if openclaw gateway process is running
+gateway_pid=$(pgrep -f "openclaw" 2>/dev/null | head -1 || echo "")
+gateway_ok=$([ -n "$gateway_pid" ] && echo "true" || echo "false")
+
+# Check ACP tmux sessions
+builder_acp=$(tmux has-session -t builder-acp 2>/dev/null && echo "true" || echo "false")
+devops_acp=$(tmux has-session -t devops-acp 2>/dev/null && echo "true" || echo "false")
+
+# Check shared dirs exist
+handoffs_dir=$([ -d "$HOME/.openclaw/shared/handoffs" ] && echo "true" || echo "false")
+events_dir=$([ -d "$HOME/.openclaw/shared/events" ] && echo "true" || echo "false")
+worktrees_dir=$([ -d "$HOME/.openclaw/worktrees" ] && echo "true" || echo "false")
+
+# Count open tasks from state store
+open_tasks=0
+tasks_file="$HOME/.openclaw/shared/tasks.json"
+if [ -f "$tasks_file" ]; then
+  open_tasks=$(python3 -c "
+import json, sys
+with open('$tasks_file') as f:
+  d = json.load(f)
+print(sum(1 for v in d.values() if v.get('status') in ('pending', 'in_progress')))
+" 2>/dev/null || echo "0")
+fi
+
+# Write atomic JSON output
+tmp=$(mktemp "$HOME/.openclaw/shared/.monitor-status.XXXXXX.tmp")
+cat > "$tmp" << JSON
+{
+  "ts": "$ts",
+  "gateway": { "running": $gateway_ok, "pid": "${gateway_pid:-null}" },
+  "acp_sessions": {
+    "builder_acp": $builder_acp,
+    "devops_acp": $devops_acp
+  },
+  "shared_dirs": {
+    "handoffs": $handoffs_dir,
+    "events": $events_dir,
+    "worktrees": $worktrees_dir
+  },
+  "open_tasks": $open_tasks
+}
+JSON
+mv "$tmp" "$OUTPUT"
+SCRIPT
+chmod +x ~/.openclaw/bin/check-agents.sh
+```
+
+- [ ] **Step 3: Run once manually to verify output**
+```bash
+~/.openclaw/bin/check-agents.sh
+cat ~/.openclaw/shared/monitor-status.json | python3 -m json.tool
+```
+Expected: valid JSON with `gateway`, `acp_sessions`, `shared_dirs`, `open_tasks` fields.
+
+- [ ] **Step 4: Install system cron (every 10 minutes)**
+```bash
+# Add to crontab if not already present
+(crontab -l 2>/dev/null; echo "*/10 * * * * $HOME/.openclaw/bin/check-agents.sh >> $HOME/.openclaw/logs/monitor.log 2>&1") | \
+  sort -u | crontab -
+crontab -l | grep check-agents
+```
+Expected: cron entry printed — `*/10 * * * * .../check-agents.sh`.
+
+- [ ] **Step 5: Add log directory**
+```bash
+mkdir -p ~/.openclaw/logs
+echo "Log directory ready: ~/.openclaw/logs"
+```
+
+---
+
+### Task 28: Commit plan and spec to claude_code_src repo
 
 **Files:**
 - This plan is already at `docs/superpowers/plans/2026-04-02-openclaw-agent-team.md`
@@ -2216,7 +2619,8 @@ git commit -m "docs: add openclaw agent team implementation plan"
 | 2.3 P2P Visibility | Task 15 |
 | 2.4 State Store (file-locked) | Task 11 |
 | 2.5 Config Override Hierarchy | Task 8 (models.json step) |
-| 2.6 TID Format | Task 10 |
+| 2.6 Monitoring Heartbeat | Task 26 (check-agents.sh + system cron) |
+| 2.7 TID Format | Task 10 |
 | 2.7 Git Worktree per Feature | Task 5 (冷燕 SOUL.md) |
 | 2.8 GitHub as Single Source of Truth | Tasks 2–5 (SOUL.md rules) |
 | 2.9 tmux Persistent ACP Sessions | Tasks 4–5 (SOUL.md) |
